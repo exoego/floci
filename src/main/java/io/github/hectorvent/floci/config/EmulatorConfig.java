@@ -531,6 +531,7 @@ public interface EmulatorConfig {
         IamServiceConfig iam();
         MskServiceConfig msk();
         AmazonMqServiceConfig amazonmq();
+        KinesisAnalyticsServiceConfig kinesisAnalytics();
         ElastiCacheServiceConfig elasticache();
         MemoryDbServiceConfig memorydb();
         RdsServiceConfig rds();
@@ -570,6 +571,7 @@ public interface EmulatorConfig {
         CodeDeployServiceConfig codedeploy();
         CodePipelineServiceConfig codepipeline();
         AutoScalingServiceConfig autoscaling();
+        ApplicationAutoScalingServiceConfig applicationautoscaling();
         ElasticBeanstalkServiceConfig elasticbeanstalk();
         BackupServiceConfig backup();
         NeptuneServiceConfig neptune();
@@ -693,6 +695,11 @@ public interface EmulatorConfig {
         boolean enabled();
     }
 
+    interface ApplicationAutoScalingServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+    }
+
     interface ElasticBeanstalkServiceConfig {
         @WithDefault("true")
         boolean enabled();
@@ -812,6 +819,23 @@ public interface EmulatorConfig {
         String defaultImage();
     }
 
+    interface KinesisAnalyticsServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** When true, StartApplication comes up RUNNING immediately with no backing Flink
+         *  container. Useful for tests and hosts without a Docker daemon. */
+        @WithDefault("false")
+        boolean mock();
+
+        /**
+         * Optional fixed image used for every application regardless of the requested
+         * {@code RuntimeEnvironment} (private registry mirror, pinned patch). When unset, the image
+         * is chosen from the runtime via {@code KinesisAnalyticsRuntimes.imageFor(runtimeEnvironment)}.
+         */
+        Optional<String> defaultImage();
+    }
+
     interface ElastiCacheServiceConfig {
         @WithDefault("true")
         boolean enabled();
@@ -853,6 +877,10 @@ public interface EmulatorConfig {
     }
 
     interface RdsServiceConfig {
+        String DEFAULT_POSTGRES_IMAGE = "postgres:16-alpine";
+        String DEFAULT_MYSQL_IMAGE = "mysql:8.0";
+        String DEFAULT_MARIADB_IMAGE = "mariadb:11";
+
         @WithDefault("true")
         boolean enabled();
 
@@ -868,14 +896,17 @@ public interface EmulatorConfig {
         @WithDefault("7099")
         int proxyMaxPort();
 
-        @WithDefault("postgres:16-alpine")
-        String defaultPostgresImage();
+        /** Empty when Floci should adapt its built-in image to the requested engine version. */
+        Optional<String> defaultPostgresImage();
 
-        @WithDefault("mysql:8.0")
-        String defaultMysqlImage();
+        /** Empty when Floci should adapt its built-in image to the requested engine version. */
+        Optional<String> defaultMysqlImage();
 
-        @WithDefault("mariadb:11")
-        String defaultMariadbImage();
+        /** Empty when Floci should adapt its built-in image to the requested engine version. */
+        Optional<String> defaultMariadbImage();
+
+        /** Hostname advertised for RDS endpoints. Uses published Docker ports when configured. */
+        Optional<String> endpointHost();
 
         /** Docker network to attach DB containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
@@ -1164,6 +1195,58 @@ public interface EmulatorConfig {
     interface BedrockRuntimeServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /**
+         * Converse/InvokeModel backend: "stub" (default, hardcoded response, no
+         * external calls) or "proxy" (forwards Converse to an OpenAI-compatible
+         * /chat/completions endpoint; see {@link BedrockProxyConfig}).
+         */
+        @WithDefault("stub")
+        String backend();
+
+        BedrockProxyConfig proxy();
+    }
+
+    interface BedrockProxyConfig {
+        /**
+         * Base URL of the OpenAI-compatible backend (Ollama, OpenRouter, LiteLLM,
+         * vLLM), e.g. "http://localhost:11434/v1". Required when backend=proxy;
+         * requests are POSTed to "{url}/chat/completions".
+         */
+        Optional<String> url();
+
+        /** Sent as "Authorization: Bearer {apiKey}" when present. */
+        Optional<String> apiKey();
+
+        /**
+         * Fallback OpenAI-side model id used when no explicit mapping matches
+         * and passthrough is disabled.
+         */
+        Optional<String> defaultModel();
+
+        /**
+         * Comma-separated {@code bedrockModelId=openaiModelId} pairs, e.g.
+         * {@code "anthropic.claude-3-sonnet-20240229-v1:0=claude-3-sonnet"}.
+         * A delimited string rather than a native Map config property: Bedrock
+         * model ids contain '.' and ':', which collide with SmallRye's per-key
+         * env-var naming convention for maps.
+         */
+        Optional<String> modelMapping();
+
+        /**
+         * When true, and no explicit mapping matches, forward the raw Bedrock
+         * model id as-is instead of requiring a mapping or defaultModel.
+         */
+        @WithDefault("false")
+        boolean passthrough();
+
+        /**
+         * How long to wait for the backend to finish generating a response before
+         * failing the request with ModelTimeoutException. Larger models on
+         * CPU-backed backends (e.g. Ollama) may need more than the default.
+         */
+        @WithDefault("60")
+        int requestTimeoutSeconds();
     }
 
     interface TextractServiceConfig {
@@ -1232,6 +1315,12 @@ public interface EmulatorConfig {
 
         @WithDefault("cloudfront.net")
         String domainSuffix();
+
+        /**
+         * Exact custom-origin hostnames allowed to resolve to private or otherwise non-routable
+         * addresses. Empty by default to match CloudFront's public custom-origin boundary.
+         */
+        Optional<List<String>> allowedPrivateOriginHosts();
     }
 
     interface AppSyncServiceConfig {

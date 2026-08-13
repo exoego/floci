@@ -883,6 +883,144 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void updateStack_lambdaFileSystemConfigUpdatesInPlace() {
+        String stackName = "cfn-lambda-efs-config-stack";
+        String functionName = "cfn-lambda-efs-config-func";
+        String accessPointArn =
+                "arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", lambdaFileSystemTemplate(functionName, accessPointArn, true))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/2015-03-31/functions/" + functionName)
+        .then()
+            .statusCode(200)
+            .body("Configuration.FileSystemConfigs[0].Arn", equalTo(accessPointArn))
+            .body("Configuration.FileSystemConfigs[0].LocalMountPath", equalTo("/mnt/shared"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "UpdateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", lambdaFileSystemTemplate(functionName, accessPointArn, false))
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String resourceXml = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().asString();
+        assertThat(firstPhysicalResourceId(resourceXml), equalTo(functionName));
+
+        given()
+        .when()
+            .get("/2015-03-31/functions/" + functionName)
+        .then()
+            .statusCode(200)
+            .body("Configuration.FileSystemConfigs", nullValue());
+    }
+
+    @Test
+    void createStack_lambdaFileSystemConfigsMustBeAList() {
+        String stackName = "cfn-lambda-invalid-efs-config-stack";
+        String template = """
+            {
+              "Resources": {
+                "MyFunction": {
+                  "Type": "AWS::Lambda::Function",
+                  "Properties": {
+                    "FunctionName": "cfn-lambda-invalid-efs-config",
+                    "Runtime": "nodejs20.x",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/cfn-test-lambda-role",
+                    "Code": {
+                      "ZipFile": "exports.handler = async () => ({ statusCode: 200 });"
+                    },
+                    "VpcConfig": {
+                      "SubnetIds": ["subnet-12345678"],
+                      "SecurityGroupIds": ["sg-12345678"]
+                    },
+                    "FileSystemConfigs": {
+                      "Arn": "arn:aws:elasticfilesystem:us-east-1:000000000000:access-point/fsap-0123456789abcdef0",
+                      "LocalMountPath": "/mnt/shared"
+                    }
+                  }
+                }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackEvents")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("ROLLBACK_COMPLETE"))
+            .body(containsString("FileSystemConfigs must be a list"));
+    }
+
+    private static String lambdaFileSystemTemplate(String functionName, String accessPointArn,
+                                                   boolean includeFileSystem) {
+        String fileSystemConfig = includeFileSystem
+                ? """
+                    ,"FileSystemConfigs": [{
+                      "Arn": "%s",
+                      "LocalMountPath": "/mnt/shared"
+                    }]
+                  """.formatted(accessPointArn)
+                : "";
+        return """
+            {
+              "Resources": {
+                "MyFunction": {
+                  "Type": "AWS::Lambda::Function",
+                  "Properties": {
+                    "FunctionName": "%s",
+                    "Runtime": "nodejs20.x",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/cfn-test-lambda-role",
+                    "VpcConfig": {
+                      "SubnetIds": ["subnet-0123456789abcdef0"],
+                      "SecurityGroupIds": ["sg-0123456789abcdef0"]
+                    }
+                    %s
+                  }
+                }
+              }
+            }
+            """.formatted(functionName, fileSystemConfig);
+    }
+
+    @Test
     void createStack_kmsKeyWithOverrideTagUsesPinnedId() {
         String template = """
             {
@@ -6502,6 +6640,293 @@ class CloudFormationIntegrationTest {
             .post("/")
         .then()
             .statusCode(200);
+    }
+
+    private io.restassured.response.ValidatableResponse getAuthorizers(String apiId) {
+        return given()
+            .header("X-Amz-Target", "AmazonApiGatewayV2.GetAuthorizers")
+            .contentType(APIGWV2_CONTENT_TYPE)
+            .body("{\"ApiId\": \"" + apiId + "\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    // ── Issue #1758: AWS::ApiGatewayV2::Authorizer dropped by CloudFormation ──
+
+    @Test
+    void createStack_apiGatewayV2AuthorizerIsProvisionedAndWiredToRoute() {
+        String template = """
+            {
+              "Resources": {
+                "HttpApi": {
+                  "Type": "AWS::ApiGatewayV2::Api",
+                  "Properties": { "Name": "cfn-apigwv2-authz-api", "ProtocolType": "HTTP" }
+                },
+                "Authorizer": {
+                  "Type": "AWS::ApiGatewayV2::Authorizer",
+                  "Properties": {
+                    "ApiId": { "Ref": "HttpApi" },
+                    "Name": "cfn-jwt-authorizer",
+                    "AuthorizerType": "JWT",
+                    "IdentitySource": ["$request.header.Authorization"],
+                    "JwtConfiguration": {
+                      "Audience": ["my-client-id"],
+                      "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_xxxxx"
+                    }
+                  }
+                },
+                "Integration": {
+                  "Type": "AWS::ApiGatewayV2::Integration",
+                  "Properties": {
+                    "ApiId": { "Ref": "HttpApi" },
+                    "IntegrationType": "HTTP_PROXY",
+                    "IntegrationUri": "https://example.com",
+                    "PayloadFormatVersion": "1.0"
+                  }
+                },
+                "Route": {
+                  "Type": "AWS::ApiGatewayV2::Route",
+                  "Properties": {
+                    "ApiId": { "Ref": "HttpApi" },
+                    "RouteKey": "GET /hello",
+                    "AuthorizationType": "JWT",
+                    "AuthorizerId": { "Ref": "Authorizer" },
+                    "Target": { "Fn::Join": ["/", ["integrations", { "Ref": "Integration" }]] }
+                  }
+                }
+              },
+              "Outputs": {
+                "ApiId": { "Value": { "Ref": "HttpApi" } },
+                "AuthorizerId": { "Value": { "Ref": "Authorizer" } },
+                "RouteId": { "Value": { "Ref": "Route" } }
+              }
+            }
+            """;
+
+        String stackName = "cfn-apigwv2-authorizer-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String createXml = apigwv2DescribeStacks(stackName);
+        String apiId = apigwOutputValue(createXml, "ApiId");
+        String authorizerId = apigwOutputValue(createXml, "AuthorizerId");
+        String routeId = apigwOutputValue(createXml, "RouteId");
+
+        // The authorizer is a real resource, not dropped by the default-case stub.
+        getAuthorizers(apiId).body("Items.size()", equalTo(1))
+                .body("Items[0].AuthorizerId", equalTo(authorizerId))
+                .body("Items[0].Name", equalTo("cfn-jwt-authorizer"))
+                .body("Items[0].AuthorizerType", equalTo("JWT"))
+                .body("Items[0].IdentitySource", hasItem("$request.header.Authorization"))
+                .body("Items[0].JwtConfiguration.Issuer",
+                        equalTo("https://cognito-idp.us-east-1.amazonaws.com/us-east-1_xxxxx"));
+
+        // The route's Ref to the authorizer resolved to a real id and was persisted.
+        getRoutes(apiId).body("Items.size()", equalTo(1))
+                .body("Items[0].RouteId", equalTo(routeId))
+                .body("Items[0].AuthorizerId", equalTo(authorizerId));
+    }
+
+    @Test
+    void createStack_apiGatewayV2AuthorizerAcceptsScalarIdentitySource() {
+        // IdentitySource is documented as Array of String, but ApiGatewayV2Service.createAuthorizer
+        // already accepts a bare scalar string too — the CFN provisioner must not be stricter than
+        // the service it calls, or a template written with the scalar form silently loses its
+        // identity source instead of erroring or working.
+        String template = """
+            {
+              "Resources": {
+                "HttpApi": {
+                  "Type": "AWS::ApiGatewayV2::Api",
+                  "Properties": { "Name": "cfn-apigwv2-authz-scalar-api", "ProtocolType": "HTTP" }
+                },
+                "Authorizer": {
+                  "Type": "AWS::ApiGatewayV2::Authorizer",
+                  "Properties": {
+                    "ApiId": { "Ref": "HttpApi" },
+                    "Name": "cfn-jwt-authorizer-scalar",
+                    "AuthorizerType": "JWT",
+                    "IdentitySource": "$request.header.Authorization",
+                    "JwtConfiguration": {
+                      "Audience": ["my-client-id"],
+                      "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_xxxxx"
+                    }
+                  }
+                }
+              },
+              "Outputs": {
+                "ApiId": { "Value": { "Ref": "HttpApi" } }
+              }
+            }
+            """;
+
+        String stackName = "cfn-apigwv2-authorizer-scalar-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String apiId = apigwOutputValue(apigwv2DescribeStacks(stackName), "ApiId");
+
+        getAuthorizers(apiId).body("Items.size()", equalTo(1))
+                .body("Items[0].IdentitySource", hasItem("$request.header.Authorization"));
+    }
+
+    @Test
+    void createStack_apiGatewayV2RouteResolvesAuthorizerIdViaGetAtt() {
+        // Ref already resolved AuthorizerId via the physical id (covered above); Fn::GetAtt reads
+        // a separate attributes map that provisionApiGatewayV2Authorizer must also populate, or
+        // the route ends up wired to the literal placeholder string "Authorizer.AuthorizerId"
+        // instead of the real id.
+        String template = """
+            {
+              "Resources": {
+                "HttpApi": {
+                  "Type": "AWS::ApiGatewayV2::Api",
+                  "Properties": { "Name": "cfn-apigwv2-authz-getatt-api", "ProtocolType": "HTTP" }
+                },
+                "Authorizer": {
+                  "Type": "AWS::ApiGatewayV2::Authorizer",
+                  "Properties": {
+                    "ApiId": { "Ref": "HttpApi" },
+                    "Name": "cfn-jwt-authorizer-getatt",
+                    "AuthorizerType": "JWT",
+                    "IdentitySource": ["$request.header.Authorization"],
+                    "JwtConfiguration": {
+                      "Audience": ["my-client-id"],
+                      "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_xxxxx"
+                    }
+                  }
+                },
+                "Integration": {
+                  "Type": "AWS::ApiGatewayV2::Integration",
+                  "Properties": {
+                    "ApiId": { "Ref": "HttpApi" },
+                    "IntegrationType": "HTTP_PROXY",
+                    "IntegrationUri": "https://example.com",
+                    "PayloadFormatVersion": "1.0"
+                  }
+                },
+                "Route": {
+                  "Type": "AWS::ApiGatewayV2::Route",
+                  "Properties": {
+                    "ApiId": { "Ref": "HttpApi" },
+                    "RouteKey": "GET /hello",
+                    "AuthorizationType": "JWT",
+                    "AuthorizerId": { "Fn::GetAtt": ["Authorizer", "AuthorizerId"] },
+                    "Target": { "Fn::Join": ["/", ["integrations", { "Ref": "Integration" }]] }
+                  }
+                }
+              },
+              "Outputs": {
+                "ApiId": { "Value": { "Ref": "HttpApi" } },
+                "AuthorizerId": { "Value": { "Ref": "Authorizer" } }
+              }
+            }
+            """;
+
+        String stackName = "cfn-apigwv2-authorizer-getatt-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        String createXml = apigwv2DescribeStacks(stackName);
+        String apiId = apigwOutputValue(createXml, "ApiId");
+        String authorizerId = apigwOutputValue(createXml, "AuthorizerId");
+
+        // The route's GetAtt resolved to the real authorizer id, not the literal placeholder.
+        getRoutes(apiId).body("Items.size()", equalTo(1))
+                .body("Items[0].AuthorizerId", equalTo(authorizerId));
+    }
+
+    @Test
+    void deleteStack_apiGatewayV2AuthorizerOnNonStackOwnedApiIsRemoved() {
+        // The API is created out-of-band (not by this stack) and referenced by a plain literal
+        // id, the same shape as a template parameter — deliberately not { "Ref": ... } to an
+        // AWS::ApiGatewayV2::Api resource in this stack. This is the scenario the scoped delete
+        // path exists for: AWS::ApiGatewayV2::Api's own delete cascades to its authorizers, which
+        // would make a stack-owned-API test pass even with no delete case for the authorizer at
+        // all. Here the API survives stack deletion, so the authorizer's removal can only be
+        // attributed to the authorizer's own scoped delete case actually running.
+        String apiId = given()
+                .header("X-Amz-Target", "AmazonApiGatewayV2.CreateApi")
+                .contentType(APIGWV2_CONTENT_TYPE)
+                .body("{\"Name\": \"cfn-apigwv2-authz-delete-external-api\", \"ProtocolType\": \"HTTP\"}")
+            .when()
+                .post("/")
+            .then()
+                .statusCode(201)
+                .extract().path("ApiId");
+
+        String template = """
+            {
+              "Resources": {
+                "Authorizer": {
+                  "Type": "AWS::ApiGatewayV2::Authorizer",
+                  "Properties": {
+                    "ApiId": "%s",
+                    "Name": "cfn-jwt-authorizer-delete",
+                    "AuthorizerType": "JWT",
+                    "IdentitySource": ["$request.header.Authorization"],
+                    "JwtConfiguration": {
+                      "Audience": ["my-client-id"],
+                      "Issuer": "https://cognito-idp.us-east-1.amazonaws.com/us-east-1_xxxxx"
+                    }
+                  }
+                }
+              }
+            }
+            """.formatted(apiId);
+
+        String stackName = "cfn-apigwv2-authorizer-delete-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        getAuthorizers(apiId).body("Items.size()", equalTo(1));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        // The API was never part of the stack, so it (and GetAuthorizers against it) still works
+        // — the authorizer itself must be gone.
+        getAuthorizers(apiId).body("Items.size()", equalTo(0));
     }
 
     // ── SAM AWS::Serverless::Function PackageType: Image dropped by the transform ──
