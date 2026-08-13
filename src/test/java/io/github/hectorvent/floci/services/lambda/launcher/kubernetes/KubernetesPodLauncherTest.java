@@ -183,6 +183,36 @@ class KubernetesPodLauncherTest {
     }
 
     @Test
+    void launchFailureKeepsPortReservedWhenPodDeleteIsNotConfirmed() {
+        // Once the pod is parked in Failed, every further Kubernetes API call fails, so
+        // the cleanup delete can never confirm the pod is gone. The pod could still reach
+        // Running later and poll AWS_LAMBDA_RUNTIME_API, so the port must stay reserved
+        // instead of going back to the pool for another environment.
+        var failingClient = spy(client);
+        doAnswer(invocation -> {
+            var failedPodExists = client.pods().inNamespace("default").list().getItems().stream()
+                    .anyMatch(p -> p.getStatus() != null && "Failed".equals(p.getStatus().getPhase()));
+            if (failedPodExists) {
+                throw new RuntimeException("kube api down");
+            }
+            return invocation.callRealMethod();
+        }).when(failingClient).pods();
+        var failingLauncher = new KubernetesPodLauncher(failingClient, config,
+                runtimeApiServerFactory, imageResolver, addressResolver, awsEnv, layerService,
+                new LambdaPodSpecFactory(config), logStreamer, s3Service);
+        markPodPhaseInBackground("floci-lambda-my-fn-", "Failed");
+
+        assertThatThrownBy(() -> failingLauncher.launch(function()))
+                .isInstanceOf(RuntimeException.class);
+
+        verify(runtimeApiServer).stop();
+        verify(runtimeApiServerFactory, never()).release(runtimeApiServer);
+        assertThat(client.pods().inNamespace("default").list().getItems())
+                .as("the unconfirmed pod is left for a later sweep")
+                .isNotEmpty();
+    }
+
+    @Test
     void podThatExitsCleanlyIsTerminalNotATimeout() {
         // A runtime that exits before serving parks the pod in Succeeded; the launch
         // must fail fast instead of blocking for the full startup timeout.

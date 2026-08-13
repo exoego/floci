@@ -229,9 +229,7 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
             return handle;
         } catch (RuntimeException e) {
             LOG.errorv(e, "Pod launch failed for function {0}; cleaning up", fn.getFunctionName());
-            if (podName != null) {
-                deletePod(namespace, podName);
-            }
+            boolean podGone = podName == null || deletePod(namespace, podName);
             // Stop the server before releasing its port number, or the still-listening
             // Vert.x server makes the port unusable for every later cold start.
             try {
@@ -242,10 +240,19 @@ public class KubernetesPodLauncher implements LambdaRuntimeLauncher {
                 LOG.debugv("Runtime API server stop failed during launch cleanup: {0}",
                         stopFailure.getMessage());
             }
-            try {
-                runtimeApiServerFactory.release(runtimeApiServer);
-            } catch (Exception ignore) {
-                LOG.debugv("Runtime API port release failed during launch cleanup: {0}", ignore.getMessage());
+            // Same rule as stop(): the port number goes back to the pool only once the pod
+            // is confirmed gone. A half-created pod that later reaches Running polls
+            // AWS_LAMBDA_RUNTIME_API on this port, and a released port could by then be
+            // serving a different environment.
+            if (podGone) {
+                try {
+                    runtimeApiServerFactory.release(runtimeApiServer);
+                } catch (Exception ignore) {
+                    LOG.debugv("Runtime API port release failed during launch cleanup: {0}", ignore.getMessage());
+                }
+            } else {
+                LOG.warnv("Keeping the Runtime API port reserved for pod {0} because its delete "
+                        + "did not succeed.", podName);
             }
             throw e;
         }
