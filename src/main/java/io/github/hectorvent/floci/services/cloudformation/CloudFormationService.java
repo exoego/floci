@@ -21,6 +21,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -100,6 +101,11 @@ public class CloudFormationService {
             LOG.infov("Loaded {0} CloudFormation stack(s) and {1} export(s) from storage",
                     stacks.size(), exports.size());
         }
+    }
+
+    @PreDestroy
+    void stop() {
+        executor.shutdownNow();
     }
 
     private void persistStack(Stack stack) {
