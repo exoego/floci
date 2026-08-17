@@ -18,6 +18,7 @@ import java.util.Random;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 import org.jboss.logging.Logger;
@@ -28,6 +29,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.ec2.model.Address;
@@ -48,6 +50,7 @@ import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.InternetGatewayAttachment;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.IpRange;
+import io.github.hectorvent.floci.services.ec2.model.Ipv6Range;
 import io.github.hectorvent.floci.services.ec2.model.KeyPair;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
@@ -57,8 +60,10 @@ import io.github.hectorvent.floci.services.ec2.model.NetworkAcl;
 import io.github.hectorvent.floci.services.ec2.model.NetworkAclAssociation;
 import io.github.hectorvent.floci.services.ec2.model.NetworkAclEntry;
 import io.github.hectorvent.floci.services.ec2.model.PrefixList;
+import io.github.hectorvent.floci.services.ec2.model.PrefixListId;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListEntry;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
+import io.github.hectorvent.floci.services.ec2.model.ReferencedSecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.Reservation;
 import io.github.hectorvent.floci.services.ec2.model.Route;
 import io.github.hectorvent.floci.services.ec2.model.RouteTable;
@@ -68,6 +73,10 @@ import io.github.hectorvent.floci.services.ec2.model.SecurityGroupRule;
 import io.github.hectorvent.floci.services.ec2.model.Snapshot;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ec2.model.TransitGateway;
+import io.github.hectorvent.floci.services.ec2.model.TransitGatewayOptions;
+import io.github.hectorvent.floci.services.ec2.model.TransitGatewayRouteTable;
+import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import io.github.hectorvent.floci.services.ec2.model.Volume;
 import io.github.hectorvent.floci.services.ec2.model.VolumeAttachment;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
@@ -85,6 +94,14 @@ public class Ec2Service implements ContainerTeardown {
     private static final Logger LOG = Logger.getLogger(Ec2Service.class);
     private static final DateTimeFormatter ISO_FMT = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
             .withZone(ZoneOffset.UTC);
+    private static final int DEFAULT_ROOT_VOLUME_SIZE_GIB = 8;
+    private static final String DEFAULT_ROOT_VOLUME_TYPE = "gp3";
+    /** The accounts behind the two non-self owner aliases DescribeImages accepts. */
+    private static final String AMAZON_OWNER_ID = "137112412989";
+    private static final String AWS_MARKETPLACE_OWNER_ID = "679593333241";
+    // The ASN AWS assigns when CreateTransitGateway omits Options.AmazonSideAsn.
+    private static final long DEFAULT_AMAZON_SIDE_ASN = 64512L;
+    private static final Pattern TRANSIT_GATEWAY_ID_PATTERN = Pattern.compile("^tgw-[0-9a-f]{8}([0-9a-f]{9})?$");
 
     private final String accountId;
     private final EmulatorConfig config;
@@ -115,6 +132,8 @@ public class Ec2Service implements ContainerTeardown {
     private final StorageBackend<String, SpotInstanceRequest> spotInstanceRequests;
     private final StorageBackend<String, NetworkAcl> networkAcls;
     private final StorageBackend<String, ManagedPrefixList> managedPrefixLists;
+    private final StorageBackend<String, TransitGateway> transitGateways;
+    private final StorageBackend<String, TransitGatewayRouteTable> transitGatewayRouteTables;
     // resourceId → List<Tag>
     private final StorageBackend<String, List<Tag>> tags;
     private final Set<String> seededRegions = ConcurrentHashMap.newKeySet();
@@ -145,7 +164,10 @@ public class Ec2Service implements ContainerTeardown {
                 storageFactory.create("ec2", "ec2-spot-instance-requests.json", new TypeReference<Map<String, SpotInstanceRequest>>() {}),
                 storageFactory.create("ec2", "ec2-network-acls.json", new TypeReference<Map<String, NetworkAcl>>() {}),
                 storageFactory.create("ec2", "ec2-managed-prefix-lists.json", new TypeReference<Map<String, ManagedPrefixList>>() {}),
-                storageFactory.create("ec2", "ec2-tags.json", new TypeReference<Map<String, List<Tag>>>() {}));
+                storageFactory.create("ec2", "ec2-tags.json", new TypeReference<Map<String, List<Tag>>>() {}),
+                storageFactory.create("ec2", "ec2-transit-gateways.json", new TypeReference<Map<String, TransitGateway>>() {}),
+                storageFactory.create("ec2", "ec2-transit-gateway-route-tables.json",
+                        new TypeReference<Map<String, TransitGatewayRouteTable>>() {}));
     }
 
     // Package-private for hermetic tests (pass in-memory or temp-dir-backed StorageBackends directly).
@@ -172,6 +194,40 @@ public class Ec2Service implements ContainerTeardown {
                StorageBackend<String, NetworkAcl> networkAcls,
                StorageBackend<String, ManagedPrefixList> managedPrefixLists,
                StorageBackend<String, List<Tag>> tags) {
+        this(config, containerManager, portForwardManager, amiImageResolver, imageCatalog, instanceTypeCatalog,
+                vpcs, subnets, securityGroups, securityGroupRules, internetGateways, routeTables, keyPairs,
+                addresses, instances, volumes, registeredImages, snapshots, launchTemplates, vpcEndpoints,
+                natGateways, spotInstanceRequests, networkAcls, managedPrefixLists, tags,
+                new InMemoryStorage<>(), new InMemoryStorage<>());
+    }
+
+    // Package-private for hermetic tests, transit-gateway-aware. The shorter overload above keeps its
+    // arity so existing fixtures still resolve it (#2103 and #2106 both broke CI by moving it).
+    Ec2Service(EmulatorConfig config, Ec2ContainerManager containerManager,
+               Ec2PortForwardManager portForwardManager,
+               AmiImageResolver amiImageResolver, Ec2ImageCatalog imageCatalog,
+               Ec2InstanceTypeCatalog instanceTypeCatalog,
+               StorageBackend<String, Vpc> vpcs,
+               StorageBackend<String, Subnet> subnets,
+               StorageBackend<String, SecurityGroup> securityGroups,
+               StorageBackend<String, SecurityGroupRule> securityGroupRules,
+               StorageBackend<String, InternetGateway> internetGateways,
+               StorageBackend<String, RouteTable> routeTables,
+               StorageBackend<String, KeyPair> keyPairs,
+               StorageBackend<String, Address> addresses,
+               StorageBackend<String, Instance> instances,
+               StorageBackend<String, Volume> volumes,
+               StorageBackend<String, Image> registeredImages,
+               StorageBackend<String, Snapshot> snapshots,
+               StorageBackend<String, LaunchTemplate> launchTemplates,
+               StorageBackend<String, VpcEndpoint> vpcEndpoints,
+               StorageBackend<String, NatGateway> natGateways,
+               StorageBackend<String, SpotInstanceRequest> spotInstanceRequests,
+               StorageBackend<String, NetworkAcl> networkAcls,
+               StorageBackend<String, ManagedPrefixList> managedPrefixLists,
+               StorageBackend<String, List<Tag>> tags,
+               StorageBackend<String, TransitGateway> transitGateways,
+               StorageBackend<String, TransitGatewayRouteTable> transitGatewayRouteTables) {
         this.accountId = config.defaultAccountId();
         this.config = config;
         this.containerManager = containerManager;
@@ -198,6 +254,8 @@ public class Ec2Service implements ContainerTeardown {
         this.networkAcls = networkAcls;
         this.managedPrefixLists = managedPrefixLists;
         this.tags = tags;
+        this.transitGateways = transitGateways;
+        this.transitGatewayRouteTables = transitGatewayRouteTables;
     }
 
     @PostConstruct
@@ -562,6 +620,23 @@ public class Ec2Service implements ContainerTeardown {
     // Managed prefix lists
     // =========================================================================
 
+    /**
+     * Name prefixes AWS reserves for its own gateway-endpoint lists. The trailing dot is part of
+     * each: {@code com.amazonaws-probe} is accepted on AWS, so matching without it over-rejects.
+     */
+    private static final List<String> RESERVED_PREFIX_LIST_NAME_PREFIXES =
+            List.of("com.amazonaws.", "com.amazon.", "com.aws.");
+
+    /** AWS applies the reserved-name rule to a rename as well as a create. */
+    private void requireUnreservedPrefixListName(String prefixListName) {
+        for (String reserved : RESERVED_PREFIX_LIST_NAME_PREFIXES) {
+            if (prefixListName.startsWith(reserved)) {
+                throw new AwsException("InvalidParameterValue",
+                        "The prefix list name cannot begin with (com.amazonaws., com.amazon., com.aws.).", 400);
+            }
+        }
+    }
+
     private List<ManagedPrefixList> awsManagedPrefixLists(String region) {
         return List.of(
                 awsManagedPrefixList(region, "pl-63a5400a", "com.amazonaws." + region + ".s3",
@@ -595,6 +670,7 @@ public class Ec2Service implements ContainerTeardown {
         if (prefixListName == null || prefixListName.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter PrefixListName.", 400);
         }
+        requireUnreservedPrefixListName(prefixListName);
         if (!"IPv4".equals(addressFamily) && !"IPv6".equals(addressFamily)) {
             throw new AwsException("InvalidParameterValue",
                     "Invalid value '" + addressFamily + "' for addressFamily. Valid values are IPv4 and IPv6.", 400);
@@ -705,6 +781,7 @@ public class Ec2Service implements ContainerTeardown {
                 list.setMaxEntries(maxEntries);
             }
             if (prefixListName != null && !prefixListName.isBlank()) {
+                requireUnreservedPrefixListName(prefixListName);
                 list.setPrefixListName(prefixListName);
             }
 
@@ -812,6 +889,361 @@ public class Ec2Service implements ContainerTeardown {
         return sb.toString();
     }
 
+    // ─── Transit Gateways ──────────────────────────────────────────────────────
+
+    /**
+     * Creates a transit gateway. Option defaults, and the fact that the default route table is
+     * minted during creation rather than afterwards, were taken from a live AWS account rather
+     * than the documentation.
+     *
+     * <p>AWS returns the gateway as {@code pending} and reaches {@code available} about 50
+     * seconds later. Nothing here is slow, so the settled state is what the caller sees, the
+     * same compression {@code createManagedPrefixList} applies.
+     */
+    public TransitGateway createTransitGateway(String region, String description,
+                                               TransitGatewayOptions requested, List<Tag> gatewayTags) {
+        String transitGatewayId = "tgw-" + randomHex(17);
+        TransitGateway gateway = new TransitGateway();
+        gateway.setTransitGatewayId(transitGatewayId);
+        gateway.setTransitGatewayArn(AwsArnUtils.Arn
+                .of("ec2", region, accountId, "transit-gateway/" + transitGatewayId).toString());
+        gateway.setState("available");
+        gateway.setOwnerId(accountId);
+        gateway.setDescription(description);
+        gateway.setCreationTime(ISO_FMT.format(Instant.now()));
+        gateway.setRegion(region);
+        gateway.setOptions(resolveTransitGatewayOptions(requested));
+
+        TransitGatewayOptions options = gateway.getOptions();
+        if ("enable".equals(options.getDefaultRouteTableAssociation())
+                || "enable".equals(options.getDefaultRouteTablePropagation())) {
+            TransitGatewayRouteTable defaultRouteTable = createDefaultTransitGatewayRouteTable(region, gateway);
+            if ("enable".equals(options.getDefaultRouteTableAssociation())) {
+                options.setAssociationDefaultRouteTableId(defaultRouteTable.getTransitGatewayRouteTableId());
+            }
+            if ("enable".equals(options.getDefaultRouteTablePropagation())) {
+                options.setPropagationDefaultRouteTableId(defaultRouteTable.getTransitGatewayRouteTableId());
+            }
+        }
+
+        if (gatewayTags != null && !gatewayTags.isEmpty()) {
+            gateway.setTags(new ArrayList<>(gatewayTags));
+            tags.put(transitGatewayId, new ArrayList<>(gatewayTags));
+        }
+        transitGateways.put(key(region, transitGatewayId), gateway);
+        return gateway;
+    }
+
+    private TransitGatewayOptions resolveTransitGatewayOptions(TransitGatewayOptions requested) {
+        TransitGatewayOptions options = new TransitGatewayOptions();
+        options.setAmazonSideAsn(DEFAULT_AMAZON_SIDE_ASN);
+        options.setAutoAcceptSharedAttachments("disable");
+        options.setDefaultRouteTableAssociation("enable");
+        options.setDefaultRouteTablePropagation("enable");
+        options.setVpnEcmpSupport("enable");
+        options.setDnsSupport("enable");
+        options.setSecurityGroupReferencingSupport("disable");
+        options.setMulticastSupport("disable");
+        if (requested == null) {
+            return options;
+        }
+        if (requested.getAmazonSideAsn() != null) {
+            options.setAmazonSideAsn(requested.getAmazonSideAsn());
+        }
+        if (requested.getAutoAcceptSharedAttachments() != null) {
+            options.setAutoAcceptSharedAttachments(requested.getAutoAcceptSharedAttachments());
+        }
+        if (requested.getDefaultRouteTableAssociation() != null) {
+            options.setDefaultRouteTableAssociation(requested.getDefaultRouteTableAssociation());
+        }
+        if (requested.getDefaultRouteTablePropagation() != null) {
+            options.setDefaultRouteTablePropagation(requested.getDefaultRouteTablePropagation());
+        }
+        if (requested.getVpnEcmpSupport() != null) {
+            options.setVpnEcmpSupport(requested.getVpnEcmpSupport());
+        }
+        if (requested.getDnsSupport() != null) {
+            options.setDnsSupport(requested.getDnsSupport());
+        }
+        if (requested.getSecurityGroupReferencingSupport() != null) {
+            options.setSecurityGroupReferencingSupport(requested.getSecurityGroupReferencingSupport());
+        }
+        if (requested.getMulticastSupport() != null) {
+            options.setMulticastSupport(requested.getMulticastSupport());
+        }
+        if (requested.getTransitGatewayCidrBlocks() != null) {
+            options.setTransitGatewayCidrBlocks(new ArrayList<>(requested.getTransitGatewayCidrBlocks()));
+        }
+        return options;
+    }
+
+    private TransitGatewayRouteTable createDefaultTransitGatewayRouteTable(String region, TransitGateway gateway) {
+        TransitGatewayRouteTable routeTable = new TransitGatewayRouteTable();
+        String routeTableId = "tgw-rtb-" + randomHex(17);
+        routeTable.setTransitGatewayRouteTableId(routeTableId);
+        routeTable.setTransitGatewayId(gateway.getTransitGatewayId());
+        routeTable.setState("available");
+        routeTable.setDefaultAssociationRouteTable("enable".equals(gateway.getOptions().getDefaultRouteTableAssociation()));
+        routeTable.setDefaultPropagationRouteTable("enable".equals(gateway.getOptions().getDefaultRouteTablePropagation()));
+        routeTable.setCreationTime(ISO_FMT.format(Instant.now()));
+        routeTable.setRegion(region);
+        transitGatewayRouteTables.put(key(region, routeTableId), routeTable);
+        return routeTable;
+    }
+
+    public List<TransitGateway> describeTransitGateways(String region, List<String> transitGatewayIds,
+                                                        Map<String, List<String>> filters) {
+        transitGatewayIds.forEach(Ec2Service::requireWellFormedTransitGatewayId);
+        List<TransitGateway> all = transitGateways.scan(k -> true).stream()
+                .filter(gateway -> region.equals(gateway.getRegion()))
+                .collect(Collectors.toList());
+
+        for (String transitGatewayId : transitGatewayIds) {
+            if (all.stream().noneMatch(gateway -> gateway.getTransitGatewayId().equals(transitGatewayId))) {
+                throw new AwsException("InvalidTransitGatewayID.NotFound",
+                        "Transit Gateway " + transitGatewayId + " was deleted or does not exist.", 400);
+            }
+        }
+        return all.stream()
+                .filter(gateway -> transitGatewayIds.isEmpty()
+                        || transitGatewayIds.contains(gateway.getTransitGatewayId()))
+                .filter(gateway -> matchesFilters(gateway, filters, region))
+                .collect(Collectors.toList());
+    }
+
+    public TransitGateway modifyTransitGateway(String region, String transitGatewayId, String description,
+                                               TransitGatewayOptions changes, List<String> addCidrBlocks,
+                                               List<String> removeCidrBlocks) {
+        synchronized (lockFor(key(region, transitGatewayId))) {
+            TransitGateway gateway = getRequiredTransitGateway(region, transitGatewayId);
+            requireCoherentDefaultRouteTableChange(region, gateway, changes);
+            if (description != null) {
+                gateway.setDescription(description);
+            }
+            applyTransitGatewayOptionChanges(gateway.getOptions(), changes);
+            applyDefaultRouteTableChanges(region, gateway, changes);
+            if (removeCidrBlocks != null && !removeCidrBlocks.isEmpty()) {
+                gateway.getOptions().getTransitGatewayCidrBlocks().removeIf(removeCidrBlocks::contains);
+            }
+            if (addCidrBlocks != null) {
+                for (String cidr : addCidrBlocks) {
+                    if (!gateway.getOptions().getTransitGatewayCidrBlocks().contains(cidr)) {
+                        gateway.getOptions().getTransitGatewayCidrBlocks().add(cidr);
+                    }
+                }
+            }
+            transitGateways.put(key(region, transitGatewayId), gateway);
+            return gateway;
+        }
+    }
+
+    /**
+     * Carries a default route table flag change through to the id it governs and to the table
+     * itself. Verified against a live account: disabling drops the id from the options entirely
+     * rather than blanking it, and clears that table's own default marker while leaving the table
+     * in place — the other default, if still enabled, keeps both its id and its marker.
+     */
+    private void applyDefaultRouteTableChanges(String region, TransitGateway gateway,
+                                               TransitGatewayOptions changes) {
+        if (changes == null) {
+            return;
+        }
+        TransitGatewayOptions options = gateway.getOptions();
+        // The id on the options already carries any id the request supplied, so enabling without
+        // one keeps the table the gateway already names rather than dropping it.
+        if (changes.getDefaultRouteTableAssociation() != null) {
+            if ("enable".equals(changes.getDefaultRouteTableAssociation())) {
+                markDefaultRouteTable(region, options.getAssociationDefaultRouteTableId(), true, true);
+            } else {
+                String previous = options.getAssociationDefaultRouteTableId();
+                options.setAssociationDefaultRouteTableId(null);
+                markDefaultRouteTable(region, previous, true, false);
+            }
+        } else if (changes.getAssociationDefaultRouteTableId() != null) {
+            markDefaultRouteTable(region, changes.getAssociationDefaultRouteTableId(), true, true);
+        }
+        if (changes.getDefaultRouteTablePropagation() != null) {
+            if ("enable".equals(changes.getDefaultRouteTablePropagation())) {
+                markDefaultRouteTable(region, options.getPropagationDefaultRouteTableId(), false, true);
+            } else {
+                String previous = options.getPropagationDefaultRouteTableId();
+                options.setPropagationDefaultRouteTableId(null);
+                markDefaultRouteTable(region, previous, false, false);
+            }
+        } else if (changes.getPropagationDefaultRouteTableId() != null) {
+            markDefaultRouteTable(region, changes.getPropagationDefaultRouteTableId(), false, true);
+        }
+    }
+
+    private void markDefaultRouteTable(String region, String routeTableId, boolean association, boolean isDefault) {
+        if (routeTableId == null) {
+            return;
+        }
+        transitGatewayRouteTables.get(key(region, routeTableId)).ifPresent(routeTable -> {
+            if (association) {
+                routeTable.setDefaultAssociationRouteTable(isDefault);
+            } else {
+                routeTable.setDefaultPropagationRouteTable(isDefault);
+            }
+            transitGatewayRouteTables.put(key(region, routeTableId), routeTable);
+        });
+    }
+
+    /**
+     * A default route table flag and its id have to move together, which is what stops the two
+     * from diverging: AWS will not enable association or propagation without being told which
+     * existing route table to use, and will not accept an id alongside a disable. Verified against
+     * a live account, including that an unknown table is reported as
+     * {@code InvalidRouteTableID.NotFound} rather than a transit-gateway-specific code.
+     */
+    private void requireCoherentDefaultRouteTableChange(String region, TransitGateway gateway,
+                                                        TransitGatewayOptions changes) {
+        if (changes == null) {
+            return;
+        }
+        TransitGatewayOptions current = gateway.getOptions();
+        requireFlagAndRouteTableAgree(changes.getDefaultRouteTableAssociation(),
+                changes.getAssociationDefaultRouteTableId(),
+                current.getDefaultRouteTableAssociation(), current.getAssociationDefaultRouteTableId(),
+                "DefaultRouteTableAssociation", "AssociationDefaultRouteTableId");
+        requireFlagAndRouteTableAgree(changes.getDefaultRouteTablePropagation(),
+                changes.getPropagationDefaultRouteTableId(),
+                current.getDefaultRouteTablePropagation(), current.getPropagationDefaultRouteTableId(),
+                "DefaultRouteTablePropagation", "PropagationDefaultRouteTableId");
+        requireRouteTableOfGateway(region, gateway, changes.getAssociationDefaultRouteTableId());
+        requireRouteTableOfGateway(region, gateway, changes.getPropagationDefaultRouteTableId());
+    }
+
+    /**
+     * The flag and its route table id are judged against the gateway as it stands, not against the
+     * request alone — which is why an id may arrive on its own. Verified against a live account:
+     *
+     * <ul>
+     *   <li>an id on its own is accepted while the option is enabled, and rejected while it is
+     *       disabled, with the message quoting the stored flag rather than the request</li>
+     *   <li>{@code enable} on its own is accepted when the gateway already names a table, and
+     *       rejected when it does not</li>
+     *   <li>{@code disable} may not carry an id at all</li>
+     * </ul>
+     *
+     * <p>This runs before the table is looked up, matching AWS: a disabled option paired with an
+     * id that does not exist reports the combination rather than the missing table.
+     */
+    private void requireFlagAndRouteTableAgree(String flag, String routeTableId,
+                                               String currentFlag, String currentRouteTableId,
+                                               String flagName, String routeTableIdName) {
+        String effectiveFlag = flag != null ? flag : currentFlag;
+        if (!"enable".equals(effectiveFlag)) {
+            if (routeTableId != null) {
+                throw new AwsException("InvalidParameterCombination",
+                        "disable " + flagName + " conflicts with " + routeTableIdName + " " + routeTableId, 400);
+            }
+            return;
+        }
+        if (flag != null && routeTableId == null && currentRouteTableId == null) {
+            throw new AwsException("InvalidParameterCombination",
+                    "enable " + flagName + " conflicts with " + routeTableIdName + " null", 400);
+        }
+    }
+
+    /**
+     * A default route table has to belong to the gateway naming it. AWS reports a table owned by
+     * another gateway under the same {@code InvalidRouteTableID.NotFound} code as one that exists
+     * nowhere, but qualifies the message with the gateway; both wordings are reproduced here.
+     */
+    private void requireRouteTableOfGateway(String region, TransitGateway gateway, String routeTableId) {
+        if (routeTableId == null) {
+            return;
+        }
+        TransitGatewayRouteTable routeTable = transitGatewayRouteTables.get(key(region, routeTableId)).orElse(null);
+        if (routeTable == null) {
+            throw new AwsException("InvalidRouteTableID.NotFound",
+                    "Transit Gateway Route Table " + routeTableId + " was deleted or does not exist.", 400);
+        }
+        if (!gateway.getTransitGatewayId().equals(routeTable.getTransitGatewayId())) {
+            throw new AwsException("InvalidRouteTableID.NotFound",
+                    "Transit Gateway Route Table " + routeTableId + " was deleted or does not exist in Transit Gateway "
+                            + gateway.getTransitGatewayId() + ".", 400);
+        }
+    }
+
+    private void applyTransitGatewayOptionChanges(TransitGatewayOptions options, TransitGatewayOptions changes) {
+        if (changes == null) {
+            return;
+        }
+        if (changes.getAmazonSideAsn() != null) {
+            options.setAmazonSideAsn(changes.getAmazonSideAsn());
+        }
+        if (changes.getAutoAcceptSharedAttachments() != null) {
+            options.setAutoAcceptSharedAttachments(changes.getAutoAcceptSharedAttachments());
+        }
+        if (changes.getDefaultRouteTableAssociation() != null) {
+            options.setDefaultRouteTableAssociation(changes.getDefaultRouteTableAssociation());
+        }
+        if (changes.getAssociationDefaultRouteTableId() != null) {
+            options.setAssociationDefaultRouteTableId(changes.getAssociationDefaultRouteTableId());
+        }
+        if (changes.getDefaultRouteTablePropagation() != null) {
+            options.setDefaultRouteTablePropagation(changes.getDefaultRouteTablePropagation());
+        }
+        if (changes.getPropagationDefaultRouteTableId() != null) {
+            options.setPropagationDefaultRouteTableId(changes.getPropagationDefaultRouteTableId());
+        }
+        if (changes.getVpnEcmpSupport() != null) {
+            options.setVpnEcmpSupport(changes.getVpnEcmpSupport());
+        }
+        if (changes.getDnsSupport() != null) {
+            options.setDnsSupport(changes.getDnsSupport());
+        }
+        if (changes.getSecurityGroupReferencingSupport() != null) {
+            options.setSecurityGroupReferencingSupport(changes.getSecurityGroupReferencingSupport());
+        }
+        if (changes.getMulticastSupport() != null) {
+            options.setMulticastSupport(changes.getMulticastSupport());
+        }
+    }
+
+    /**
+     * Deletes a transit gateway and the default route table created with it, which is what the
+     * live API does — the route table disappears alongside the gateway rather than outliving it.
+     *
+     * <p>AWS reports {@code deleting} here and settles on {@code deleted} about a minute later;
+     * the returned object carries the settled state for the same reason creation does.
+     */
+    public TransitGateway deleteTransitGateway(String region, String transitGatewayId) {
+        synchronized (lockFor(key(region, transitGatewayId))) {
+            TransitGateway gateway = getRequiredTransitGateway(region, transitGatewayId);
+            transitGatewayRouteTables.scan(k -> true).stream()
+                    .filter(routeTable -> region.equals(routeTable.getRegion()))
+                    .filter(routeTable -> transitGatewayId.equals(routeTable.getTransitGatewayId()))
+                    .toList()
+                    .forEach(routeTable -> transitGatewayRouteTables
+                            .delete(key(region, routeTable.getTransitGatewayRouteTableId())));
+            transitGateways.delete(key(region, transitGatewayId));
+            tags.delete(transitGatewayId);
+            gateway.setState("deleted");
+            return gateway;
+        }
+    }
+
+    private TransitGateway getRequiredTransitGateway(String region, String transitGatewayId) {
+        if (transitGatewayId == null || transitGatewayId.isBlank()) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter TransitGatewayId.", 400);
+        }
+        return describeTransitGateways(region, List.of(transitGatewayId), Map.of()).stream()
+                .findFirst()
+                .orElseThrow(() -> new AwsException("InvalidTransitGatewayID.NotFound",
+                        "Transit Gateway " + transitGatewayId + " was deleted or does not exist.", 400));
+    }
+
+    private static void requireWellFormedTransitGatewayId(String transitGatewayId) {
+        if (!TRANSIT_GATEWAY_ID_PATTERN.matcher(transitGatewayId).matches()) {
+            throw new AwsException("InvalidTransitGatewayID.Malformed",
+                    "Invalid Transit Gateway id " + transitGatewayId + ".", 400);
+        }
+    }
+
     // ─── Instances ─────────────────────────────────────────────────────────────
 
     public Reservation runInstances(String region, String imageId, String instanceType,
@@ -819,6 +1251,17 @@ public class Ec2Service implements ContainerTeardown {
                                     List<String> securityGroupIds, String subnetId,
                                     String clientToken, List<Tag> instanceTags,
                                     String userData, String iamInstanceProfileArn) {
+        return runInstances(region, imageId, instanceType, minCount, maxCount, keyName,
+                securityGroupIds, subnetId, clientToken, instanceTags, userData,
+                iamInstanceProfileArn, null);
+    }
+
+    public Reservation runInstances(String region, String imageId, String instanceType,
+                                    int minCount, int maxCount, String keyName,
+                                    List<String> securityGroupIds, String subnetId,
+                                    String clientToken, List<Tag> instanceTags,
+                                    String userData, String iamInstanceProfileArn,
+                                    Boolean associatePublicIp) {
         if (imageId == null || imageId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter ImageId", 400);
         }
@@ -876,6 +1319,12 @@ public class Ec2Service implements ContainerTeardown {
             inst.setPlacement(new Placement(az));
             inst.setSubnetId(finalSubnetId);
             inst.setVpcId(vpcId);
+            // AWS precedence (#1984): the launch-time AssociatePublicIpAddress
+            // override wins in both directions; the subnet's MapPublicIpOnLaunch
+            // attribute is only the default when the launch does not specify it.
+            inst.setAssociatePublicIp(associatePublicIp != null
+                    ? associatePublicIp
+                    : subnet != null && subnet.isMapPublicIpOnLaunch());
             inst.setPrivateIpAddress(privateIp);
             inst.setPrivateDnsName("ip-" + privateIp.replace('.', '-') + ".ec2.internal");
             inst.setKeyName(keyName);
@@ -914,8 +1363,8 @@ public class Ec2Service implements ContainerTeardown {
             Volume rootVol = new Volume();
             rootVol.setVolumeId(rootVolId);
             rootVol.setAvailabilityZone(az);
-            rootVol.setVolumeType("gp3");
-            rootVol.setSize(8);
+            rootVol.setVolumeType(DEFAULT_ROOT_VOLUME_TYPE);
+            rootVol.setSize(DEFAULT_ROOT_VOLUME_SIZE_GIB);
             rootVol.setState("in-use");
             rootVol.setRegion(region);
             rootVol.setCreateTime(Instant.now());
@@ -933,7 +1382,9 @@ public class Ec2Service implements ContainerTeardown {
             reservation.getInstances().add(inst);
 
             if (!config.services().ec2().mock()) {
-                ResolvedAmiImage dockerImage = amiImageResolver.resolveImage(imageId);
+                // A CreateImage AMI is not in the catalog, so resolve through its source.
+                ResolvedAmiImage dockerImage =
+                        amiImageResolver.resolveImage(resolveLaunchableImageId(region, imageId));
                 String publicKey = null;
                 if (keyName != null) {
                     KeyPair kp = findKeyPair(region, keyName);
@@ -1639,8 +2090,10 @@ public class Ec2Service implements ContainerTeardown {
         List<SecurityGroupRule> rules = new ArrayList<>();
         synchronized (lockFor(key(region, groupId))) {
             SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
+            requireKnownPrefixLists(region, permissions);
             List<IpPermission> next = new ArrayList<>(sg.getIpPermissions());
             for (IpPermission perm : permissions) {
+                resolveGroupReferences(region, sg.getVpcId(), perm);
                 next.add(perm);
                 rules.addAll(createRules(region, groupId, perm, false));
             }
@@ -1656,8 +2109,10 @@ public class Ec2Service implements ContainerTeardown {
         List<SecurityGroupRule> rules = new ArrayList<>();
         synchronized (lockFor(key(region, groupId))) {
             SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
+            requireKnownPrefixLists(region, permissions);
             List<IpPermission> next = new ArrayList<>(sg.getIpPermissionsEgress());
             for (IpPermission perm : permissions) {
+                resolveGroupReferences(region, sg.getVpcId(), perm);
                 next.add(perm);
                 rules.addAll(createRules(region, groupId, perm, true));
             }
@@ -1667,45 +2122,130 @@ public class Ec2Service implements ContainerTeardown {
         return rules;
     }
 
+    /**
+     * Flattens one permission into the {@link SecurityGroupRule} entries DescribeSecurityGroupRules
+     * serves. AWS gives every rule exactly one source, so a permission carrying several sources fans
+     * out into one rule each.
+     *
+     * <p>Deliberately does not validate the prefix lists it reads: authorize resolves every list a
+     * request names before the first write. Re-checking per permission would reopen the
+     * partial-write window, since a list can be deleted between the two checks — the group lock and
+     * the prefix list lock are different monitors. The other callers pass a CIDR-only default egress
+     * permission.
+     */
     private List<SecurityGroupRule> createRules(String region, String groupId, IpPermission perm, boolean egress) {
         List<SecurityGroupRule> rules = new ArrayList<>();
-        List<IpRange> ranges = perm.getIpRanges();
-        if (ranges == null || ranges.isEmpty()) {
-            SecurityGroupRule rule = new SecurityGroupRule();
-            rule.setSecurityGroupRuleId("sgr-" + randomHex(17));
-            rule.setGroupId(groupId);
-            rule.setGroupOwnerId(accountId);
-            rule.setEgress(egress);
-            rule.setIpProtocol(perm.getIpProtocol());
-            rule.setFromPort(perm.getFromPort());
-            rule.setToPort(perm.getToPort());
-            securityGroupRules.put(key(region, rule.getSecurityGroupRuleId()), rule);
-            rules.add(rule);
-        } else {
-            for (IpRange range : ranges) {
-                SecurityGroupRule rule = new SecurityGroupRule();
-                rule.setSecurityGroupRuleId("sgr-" + randomHex(17));
-                rule.setGroupId(groupId);
-                rule.setGroupOwnerId(accountId);
-                rule.setEgress(egress);
-                rule.setIpProtocol(perm.getIpProtocol());
-                rule.setFromPort(perm.getFromPort());
-                rule.setToPort(perm.getToPort());
+        if (perm.getIpRanges() != null) {
+            for (IpRange range : perm.getIpRanges()) {
+                SecurityGroupRule rule = newRule(groupId, perm, egress);
                 rule.setCidrIpv4(range.getCidrIp());
                 rule.setDescription(range.getDescription());
-                securityGroupRules.put(key(region, rule.getSecurityGroupRuleId()), rule);
                 rules.add(rule);
             }
         }
+        if (perm.getIpv6Ranges() != null) {
+            for (Ipv6Range range : perm.getIpv6Ranges()) {
+                SecurityGroupRule rule = newRule(groupId, perm, egress);
+                rule.setCidrIpv6(range.getCidrIpv6());
+                rule.setDescription(range.getDescription());
+                rules.add(rule);
+            }
+        }
+        if (perm.getUserIdGroupPairs() != null) {
+            for (UserIdGroupPair pair : perm.getUserIdGroupPairs()) {
+                SecurityGroupRule rule = newRule(groupId, perm, egress);
+                ReferencedSecurityGroup ref = new ReferencedSecurityGroup();
+                ref.setGroupId(pair.getGroupId());
+                ref.setUserId(pair.getUserId());
+                rule.setReferencedGroupInfo(ref);
+                rule.setDescription(pair.getDescription());
+                rules.add(rule);
+            }
+        }
+        if (perm.getPrefixListIds() != null) {
+            for (PrefixListId prefixList : perm.getPrefixListIds()) {
+                SecurityGroupRule rule = newRule(groupId, perm, egress);
+                rule.setPrefixListId(prefixList.getPrefixListId());
+                rule.setDescription(prefixList.getDescription());
+                rules.add(rule);
+            }
+        }
+        // Real AWS rejects a permission with no source at all; Floci keeps accepting it, so it still
+        // needs a rule to describe.
+        if (rules.isEmpty()) {
+            rules.add(newRule(groupId, perm, egress));
+        }
+        for (SecurityGroupRule rule : rules) {
+            securityGroupRules.put(key(region, rule.getSecurityGroupRuleId()), rule);
+        }
         return rules;
+    }
+
+    /**
+     * Resolves every prefix list a request names before anything is written. AWS rejects the whole
+     * call, so a permission carrying a valid CIDR alongside an unknown list must persist neither.
+     */
+    private void requireKnownPrefixLists(String region, List<IpPermission> permissions) {
+        for (IpPermission perm : permissions) {
+            if (perm.getPrefixListIds() == null) {
+                continue;
+            }
+            for (PrefixListId prefixList : perm.getPrefixListIds()) {
+                getRequiredManagedPrefixList(region, prefixList.getPrefixListId());
+            }
+        }
+    }
+
+    private SecurityGroupRule newRule(String groupId, IpPermission perm, boolean egress) {
+        SecurityGroupRule rule = new SecurityGroupRule();
+        rule.setSecurityGroupRuleId("sgr-" + randomHex(17));
+        rule.setGroupId(groupId);
+        rule.setGroupOwnerId(accountId);
+        rule.setEgress(egress);
+        rule.setIpProtocol(perm.getIpProtocol());
+        rule.setFromPort(perm.getFromPort());
+        rule.setToPort(perm.getToPort());
+        return rule;
+    }
+
+    /**
+     * Fills in the source details AWS returns but a caller may leave out: an absent {@code UserId}
+     * is this account, and a reference made by group name is resolved to its group id so the
+     * flattened rule can carry a {@code referencedGroupInfo} (the AWS shape has no group name).
+     *
+     * <p>Group names are unique per VPC rather than per region, so resolution is confined to the
+     * VPC of the group being authorized. A name matching nothing there stays unresolved: Floci does
+     * not check that a referenced group exists, for ids either.
+     */
+    private void resolveGroupReferences(String region, String vpcId, IpPermission perm) {
+        if (perm.getUserIdGroupPairs() == null) {
+            return;
+        }
+        for (UserIdGroupPair pair : perm.getUserIdGroupPairs()) {
+            if (pair.getUserId() == null) {
+                pair.setUserId(accountId);
+            }
+            if (pair.getGroupId() == null && pair.getGroupName() != null) {
+                securityGroups.scan(k -> true).stream()
+                        .filter(sg -> sg.getRegion().equals(region)
+                                && Objects.equals(vpcId, sg.getVpcId())
+                                && pair.getGroupName().equals(sg.getGroupName()))
+                        .findFirst()
+                        .ifPresent(sg -> pair.setGroupId(sg.getGroupId()));
+            }
+        }
     }
 
     public void revokeSecurityGroupIngress(String region, String groupId, List<IpPermission> permissions) {
         ensureDefaultResources(region);
         synchronized (lockFor(key(region, groupId))) {
             SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
-            List<IpPermission> next = new ArrayList<>(sg.getIpPermissions());
-            next.removeIf(p -> matchesAnyPermission(p, permissions));
+            // Authorize stores a group reference by id, so a revoke naming it by name alone has to
+            // resolve the same way before the sources can be compared.
+            for (IpPermission perm : permissions) {
+                resolveGroupReferences(region, sg.getVpcId(), perm);
+            }
+            List<IpPermission> next = revokeSources(new ArrayList<>(sg.getIpPermissions()), permissions);
             sg.setIpPermissions(next);
             securityGroups.put(key(region, groupId), sg);
         }
@@ -1716,8 +2256,10 @@ public class Ec2Service implements ContainerTeardown {
         ensureDefaultResources(region);
         synchronized (lockFor(key(region, groupId))) {
             SecurityGroup sg = getRequiredSecurityGroup(region, groupId);
-            List<IpPermission> next = new ArrayList<>(sg.getIpPermissionsEgress());
-            next.removeIf(p -> matchesAnyPermission(p, permissions));
+            for (IpPermission perm : permissions) {
+                resolveGroupReferences(region, sg.getVpcId(), perm);
+            }
+            List<IpPermission> next = revokeSources(new ArrayList<>(sg.getIpPermissionsEgress()), permissions);
             sg.setIpPermissionsEgress(next);
             securityGroups.put(key(region, groupId), sg);
         }
@@ -1731,15 +2273,58 @@ public class Ec2Service implements ContainerTeardown {
         return sg;
     }
 
-    private boolean matchesAnyPermission(IpPermission existing, List<IpPermission> toRemove) {
-        for (IpPermission perm : toRemove) {
-            if (Objects.equals(existing.getIpProtocol(), perm.getIpProtocol())
-                    && Objects.equals(existing.getFromPort(), perm.getFromPort())
-                    && Objects.equals(existing.getToPort(), perm.getToPort())) {
-                return true;
+    /**
+     * Revocation is scoped to the sources it names, as on AWS: revoking one source leaves other
+     * permissions sharing the same protocol and ports in place, and a permission that names
+     * several sources loses only those revoked. A request naming no source at all still removes
+     * the whole matching permission, which is how a bare protocol/port revoke behaves.
+     *
+     * <p>Returns the permissions that remain.
+     */
+    private List<IpPermission> revokeSources(List<IpPermission> existing, List<IpPermission> toRemove) {
+        List<IpPermission> remaining = new ArrayList<>();
+        for (IpPermission perm : existing) {
+            boolean dropWholePermission = false;
+            boolean hadSources = hasSources(perm);
+            for (IpPermission removal : toRemove) {
+                if (!sameProtocolAndPorts(perm, removal)) {
+                    continue;
+                }
+                if (!hasSources(removal)) {
+                    dropWholePermission = true;
+                    break;
+                }
+                // authorize stores the caller's IpPermission object, so a revoke can name the very
+                // instance held on the group. Snapshot the values before mutating either list.
+                List<String> cidrs = removal.getIpRanges().stream().map(IpRange::getCidrIp).toList();
+                List<String> cidrsV6 = removal.getIpv6Ranges().stream().map(Ipv6Range::getCidrIpv6).toList();
+                List<String> lists = removal.getPrefixListIds().stream()
+                        .map(PrefixListId::getPrefixListId).toList();
+                List<String> groups = removal.getUserIdGroupPairs().stream()
+                        .map(UserIdGroupPair::getGroupId).toList();
+                perm.getIpRanges().removeIf(e -> cidrs.contains(e.getCidrIp()));
+                perm.getIpv6Ranges().removeIf(e -> cidrsV6.contains(e.getCidrIpv6()));
+                perm.getPrefixListIds().removeIf(e -> lists.contains(e.getPrefixListId()));
+                perm.getUserIdGroupPairs().removeIf(e -> groups.contains(e.getGroupId()));
+            }
+            // A permission that had sources and has lost them all is gone; one that never had any
+            // survives unless a sourceless revoke named it.
+            if (!dropWholePermission && (!hadSources || hasSources(perm))) {
+                remaining.add(perm);
             }
         }
-        return false;
+        return remaining;
+    }
+
+    private boolean sameProtocolAndPorts(IpPermission a, IpPermission b) {
+        return Objects.equals(a.getIpProtocol(), b.getIpProtocol())
+                && Objects.equals(a.getFromPort(), b.getFromPort())
+                && Objects.equals(a.getToPort(), b.getToPort());
+    }
+
+    private boolean hasSources(IpPermission perm) {
+        return !perm.getIpRanges().isEmpty() || !perm.getIpv6Ranges().isEmpty()
+                || !perm.getPrefixListIds().isEmpty() || !perm.getUserIdGroupPairs().isEmpty();
     }
 
     public List<SecurityGroupRule> describeSecurityGroupRules(String region, List<String> groupIds, List<String> ruleIds) {
@@ -1911,6 +2496,156 @@ public class Ec2Service implements ContainerTeardown {
         List<Image> images = new ArrayList<>(catalogImages);
         images.addAll(createdImages);
         return images;
+    }
+
+    public Image createImage(String region, String instanceId, String name, String description,
+                             boolean noReboot) {
+        ensureDefaultResources(region);
+        if (instanceId == null || instanceId.isBlank()) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter InstanceId", 400);
+        }
+        Instance source = getRequiredInstance(region, instanceId);
+
+        // AWS reboots the source instance by default so the image is captured from a quiesced
+        // file system; NoReboot=true opts out and accepts the integrity risk.
+        if (!noReboot) {
+            rebootInstances(region, List.of(instanceId));
+        }
+
+        // The new AMI inherits what it was captured from rather than the registerImage defaults,
+        // so DescribeImages does not report a generic x86_64 / /dev/sda1 image with no devices.
+        Image sourceImage = findImageForCapture(region, source.getImageId());
+        Image image = registerImage(region, name, description,
+                sourceImage != null ? sourceImage.getArchitecture() : null,
+                sourceImage != null ? sourceImage.getRootDeviceName() : null,
+                captureBlockDeviceMappings(region, source, sourceImage));
+
+        // Carry the launchable ancestor so RunInstances on this AMI starts the same guest instead
+        // of falling through to the catalog default.
+        image.setSourceImageId(resolveLaunchableImageId(region, source.getImageId()));
+        registeredImages.put(key(region, image.getImageId()), image);
+        return image;
+    }
+
+    /**
+     * The devices the captured AMI reports. AWS captures what the source AMI describes plus any
+     * volume attached to the instance afterwards, so a data volume added post-launch is part of
+     * the image rather than being dropped.
+     */
+    private List<BlockDeviceMapping> captureBlockDeviceMappings(String region, Instance source,
+                                                                Image sourceImage) {
+        List<BlockDeviceMapping> mappings = new ArrayList<>(sourceImageMappings(sourceImage));
+        Set<String> devices = mappings.stream()
+                .map(BlockDeviceMapping::getDeviceName)
+                .filter(Objects::nonNull)
+                .collect(Collectors.toSet());
+        for (Volume volume : volumes.scan(k -> true)) {
+            if (!region.equals(volume.getRegion())
+                    || volume.getVolumeId().equals(source.getRootVolumeId())) {
+                continue;
+            }
+            for (VolumeAttachment attachment : volume.getAttachments()) {
+                if (!source.getInstanceId().equals(attachment.getInstanceId())
+                        || !devices.add(attachment.getDevice())) {
+                    continue;
+                }
+                mappings.add(attachedMapping(volume, attachment));
+            }
+        }
+        return mappings.isEmpty() ? null : mappings;
+    }
+
+    /** The device an attached volume contributes, snapshotted as of the capture. */
+    private BlockDeviceMapping attachedMapping(Volume volume, VolumeAttachment attachment) {
+        EbsBlockDevice ebs = new EbsBlockDevice();
+        ebs.setSnapshotId("snap-" + randomHex(17));
+        ebs.setVolumeSize(volume.getSize());
+        ebs.setVolumeType(volume.getVolumeType());
+        ebs.setDeleteOnTermination(attachment.isDeleteOnTermination());
+        ebs.setEncrypted(volume.isEncrypted());
+        BlockDeviceMapping mapping = new BlockDeviceMapping();
+        mapping.setDeviceName(attachment.getDevice());
+        mapping.setEbs(ebs);
+        return mapping;
+    }
+
+    /**
+     * A registered source carries its own mappings, while a catalog entry describes only its root
+     * device, so the root is rebuilt from that rather than leaving the capture with no devices.
+     */
+    private List<BlockDeviceMapping> sourceImageMappings(Image sourceImage) {
+        if (sourceImage == null) {
+            return List.of();
+        }
+        List<BlockDeviceMapping> declared = sourceImage.getBlockDeviceMappings();
+        if (declared != null && !declared.isEmpty()) {
+            return declared.stream().map(this::recapture).toList();
+        }
+        String rootDeviceName = sourceImage.getRootDeviceName();
+        if (rootDeviceName == null || rootDeviceName.isBlank()) {
+            return List.of();
+        }
+        EbsBlockDevice ebs = new EbsBlockDevice();
+        ebs.setSnapshotId("snap-" + randomHex(17));
+        ebs.setVolumeSize(DEFAULT_ROOT_VOLUME_SIZE_GIB);
+        ebs.setVolumeType(DEFAULT_ROOT_VOLUME_TYPE);
+        ebs.setDeleteOnTermination(true);
+        BlockDeviceMapping mapping = new BlockDeviceMapping();
+        mapping.setDeviceName(rootDeviceName);
+        mapping.setEbs(ebs);
+        return List.of(mapping);
+    }
+
+    /**
+     * A capture takes its own snapshot of each device. Handing back the source AMI's snapshot ids
+     * would leave two images sharing one snapshot, so deleting either would appear to take the
+     * other's backing with it.
+     */
+    private BlockDeviceMapping recapture(BlockDeviceMapping source) {
+        BlockDeviceMapping mapping = new BlockDeviceMapping();
+        mapping.setDeviceName(source.getDeviceName());
+        EbsBlockDevice sourceEbs = source.getEbs();
+        if (sourceEbs == null) {
+            return mapping;
+        }
+        EbsBlockDevice ebs = new EbsBlockDevice();
+        ebs.setSnapshotId(sourceEbs.getSnapshotId() != null ? "snap-" + randomHex(17) : null);
+        ebs.setVolumeSize(sourceEbs.getVolumeSize());
+        ebs.setVolumeType(sourceEbs.getVolumeType());
+        ebs.setDeleteOnTermination(sourceEbs.getDeleteOnTermination());
+        ebs.setEncrypted(sourceEbs.getEncrypted());
+        mapping.setEbs(ebs);
+        return mapping;
+    }
+
+    /** The image a CreateImage source was launched from, whether catalog-backed or registered. */
+    private Image findImageForCapture(String region, String imageId) {
+        if (imageId == null || imageId.isBlank()) {
+            return null;
+        }
+        Image registered = registeredImages.get(key(region, imageId)).orElse(null);
+        if (registered != null) {
+            return registered;
+        }
+        return imageCatalog.findByIdOrAlias(imageId)
+                .map(Ec2ImageCatalog.CatalogImage::toImage)
+                .orElse(null);
+    }
+
+    /**
+     * Follows CreateImage ancestry back to an id the AMI resolver can map to a guest image.
+     * Images from RegisterImage have no source and stop the walk, as does a catalog id.
+     */
+    private String resolveLaunchableImageId(String region, String imageId) {
+        String current = imageId;
+        for (int hops = 0; hops < 16 && current != null; hops++) {
+            Image registered = registeredImages.get(key(region, current)).orElse(null);
+            if (registered == null || registered.getSourceImageId() == null) {
+                return current;
+            }
+            current = registered.getSourceImageId();
+        }
+        return current;
     }
 
     public Image registerImage(String region, String name, String description, String architecture,
@@ -2261,10 +2996,38 @@ public class Ec2Service implements ContainerTeardown {
         return imageIds == null || imageIds.isEmpty() || imageIds.contains(image.getImageId());
     }
 
+    /**
+     * {@code Owner.N} takes the aliases {@code self}, {@code amazon} and {@code aws-marketplace}
+     * beside bare account ids, while {@code imageOwnerId} is always an account id. Only
+     * {@code self} was translated, so an alias matched nothing unless an image happened to be
+     * owned by the literal string.
+     */
     private boolean matchesImageOwners(Image image, List<String> owners) {
-        return owners == null || owners.isEmpty()
-                || owners.contains(image.getOwnerId())
-                || (owners.contains("self") && accountId.equals(image.getOwnerId()));
+        if (owners == null || owners.isEmpty()) {
+            return true;
+        }
+        String ownerId = image.getOwnerId();
+        return owners.contains(ownerId)
+                || (owners.contains("self") && accountId.equals(ownerId))
+                || (owners.contains("amazon") && AMAZON_OWNER_ID.equals(ownerId))
+                || (owners.contains("aws-marketplace") && AWS_MARKETPLACE_OWNER_ID.equals(ownerId));
+    }
+
+    /**
+     * Whether an image satisfies a DescribeImages filter set. Exposed so a synthesized lookup image
+     * can be checked against the request that produced it before being returned.
+     */
+    public boolean imageMatchesFilters(Image image, Map<String, List<String>> filters) {
+        return matchesRegisteredImageFilters(image, filters);
+    }
+
+    /**
+     * Whether an image satisfies a DescribeImages owner scope. Exposed alongside
+     * {@link #imageMatchesFilters} so a synthesized lookup image faces the whole request that
+     * produced it, since {@code Owner.N} is carried outside the filter set.
+     */
+    public boolean imageMatchesOwners(Image image, List<String> owners) {
+        return matchesImageOwners(image, owners);
     }
 
     private boolean matchesRegisteredImageFilters(Image image, Map<String, List<String>> filters) {
@@ -2361,15 +3124,25 @@ public class Ec2Service implements ContainerTeardown {
         return patterns.stream().anyMatch(pattern -> wildcardMatches(pattern, value));
     }
 
+    /**
+     * AWS filter values take two wildcards, {@code *} for any run of characters and {@code ?} for
+     * exactly one. Only {@code *} was honoured here, so a {@code ?} was matched literally and a
+     * pattern like {@code ubuntu-?} found nothing, while {@link #wildcardToRegex} a few hundred
+     * lines down already treated both.
+     */
     private boolean wildcardMatches(String pattern, String value) {
         if (pattern == null) {
             return false;
         }
-        if (!pattern.contains("*")) {
+        if (!pattern.contains("*") && !pattern.contains("?")) {
             return pattern.equals(value);
         }
         String regex = pattern.chars()
-                .mapToObj(ch -> ch == '*' ? ".*" : java.util.regex.Pattern.quote(String.valueOf((char) ch)))
+                .mapToObj(ch -> switch (ch) {
+                    case '*' -> ".*";
+                    case '?' -> ".";
+                    default -> java.util.regex.Pattern.quote(String.valueOf((char) ch));
+                })
                 .collect(Collectors.joining());
         return value.matches(regex);
     }
@@ -2442,6 +3215,18 @@ public class Ec2Service implements ContainerTeardown {
         if (prefixList != null) {
             prefixList.setTags(new ArrayList<>(tagList));
             managedPrefixLists.put(storeKey, prefixList);
+            return;
+        }
+        TransitGateway gateway = transitGateways.get(storeKey).orElse(null);
+        if (gateway != null) {
+            gateway.setTags(new ArrayList<>(tagList));
+            transitGateways.put(storeKey, gateway);
+            return;
+        }
+        TransitGatewayRouteTable routeTable = transitGatewayRouteTables.get(storeKey).orElse(null);
+        if (routeTable != null) {
+            routeTable.setTags(new ArrayList<>(tagList));
+            transitGatewayRouteTables.put(storeKey, routeTable);
         }
     }
 
@@ -2481,18 +3266,52 @@ public class Ec2Service implements ContainerTeardown {
     }
 
     private String inferResourceType(String resourceId) {
-        if (resourceId.startsWith("i-")) return "instance";
-        if (resourceId.startsWith("vpc-")) return "vpc";
-        if (resourceId.startsWith("subnet-")) return "subnet";
-        if (resourceId.startsWith("sg-")) return "security-group";
-        if (resourceId.startsWith("igw-")) return "internet-gateway";
-        if (resourceId.startsWith("rtb-")) return "route-table";
-        if (resourceId.startsWith("key-")) return "key-pair";
-        if (resourceId.startsWith("eipalloc-")) return "elastic-ip";
-        if (resourceId.startsWith("lt-")) return "launch-template";
-        if (resourceId.startsWith("vpce-")) return "vpc-endpoint";
-        if (resourceId.startsWith("nat-")) return "natgateway";
-        if (resourceId.startsWith("pl-")) return "prefix-list";
+        if (resourceId.startsWith("i-")) {
+            return "instance";
+        }
+        if (resourceId.startsWith("vpc-")) {
+            return "vpc";
+        }
+        if (resourceId.startsWith("subnet-")) {
+            return "subnet";
+        }
+        if (resourceId.startsWith("sgr-")) {
+            return "security-group-rule";
+        }
+        if (resourceId.startsWith("sg-")) {
+            return "security-group";
+        }
+        if (resourceId.startsWith("igw-")) {
+            return "internet-gateway";
+        }
+        if (resourceId.startsWith("rtb-")) {
+            return "route-table";
+        }
+        if (resourceId.startsWith("key-")) {
+            return "key-pair";
+        }
+        if (resourceId.startsWith("eipalloc-")) {
+            return "elastic-ip";
+        }
+        if (resourceId.startsWith("lt-")) {
+            return "launch-template";
+        }
+        if (resourceId.startsWith("vpce-")) {
+            return "vpc-endpoint";
+        }
+        if (resourceId.startsWith("nat-")) {
+            return "natgateway";
+        }
+        if (resourceId.startsWith("pl-")) {
+            return "prefix-list";
+        }
+        // Checked before the gateway prefix, which it starts with.
+        if (resourceId.startsWith("tgw-rtb-")) {
+            return "transit-gateway-route-table";
+        }
+        if (resourceId.startsWith("tgw-")) {
+            return "transit-gateway";
+        }
         return "unknown";
     }
 
@@ -3002,6 +3821,22 @@ public class Ec2Service implements ContainerTeardown {
                 default -> true;
             };
         }
+        if (resource instanceof TransitGateway gateway) {
+            return switch (filterName) {
+                case "transit-gateway-id" -> matchesValue(values, gateway.getTransitGatewayId());
+                case "state" -> matchesValue(values, gateway.getState());
+                case "owner-id" -> matchesValue(values, gateway.getOwnerId());
+                case "options.amazon-side-asn" ->
+                        matchesValue(values, String.valueOf(gateway.getOptions().getAmazonSideAsn()));
+                case "options.association-default-route-table-id" ->
+                        matchesValue(values, gateway.getOptions().getAssociationDefaultRouteTableId());
+                case "options.propagation-default-route-table-id" ->
+                        matchesValue(values, gateway.getOptions().getPropagationDefaultRouteTableId());
+                case "options.dns-support" -> matchesValue(values, gateway.getOptions().getDnsSupport());
+                case "options.vpn-ecmp-support" -> matchesValue(values, gateway.getOptions().getVpnEcmpSupport());
+                default -> true;
+            };
+        }
         if (resource instanceof SecurityGroup sg) {
             return switch (filterName) {
                 case "group-id" -> matchesValue(values, sg.getGroupId());
@@ -3132,6 +3967,8 @@ public class Ec2Service implements ContainerTeardown {
         if (resource instanceof VpcEndpoint endpoint) return endpoint.getTags();
         if (resource instanceof NatGateway natGateway) return natGateway.getTags();
         if (resource instanceof SpotInstanceRequest sir) return sir.getTags();
+        if (resource instanceof TransitGateway gateway) return gateway.getTags();
+        if (resource instanceof TransitGatewayRouteTable routeTable) return routeTable.getTags();
         return Collections.emptyList();
     }
 

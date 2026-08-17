@@ -53,6 +53,8 @@ public class Ec2ContainerManager {
     private static final Logger LOG = Logger.getLogger(Ec2ContainerManager.class);
     private static final String USER_DATA_SCRIPT_PATH = "/tmp/user-data.sh";
     private static final Pattern MIME_BOUNDARY = Pattern.compile("(?im)^content-type:\\s*multipart/[^;]+;\\s*boundary=\"?([^\";\\n\\r]+)\"?.*$");
+    private static final List<String> ALLOWED_SSHD_PATHS = List.of("/usr/sbin/sshd", "/usr/local/sbin/sshd", "/sbin/sshd");
+
     static int containerBridgeIpAttempts = 30;
     static long containerBridgeIpPollMillis = 500;
 
@@ -192,7 +194,7 @@ public class Ec2ContainerManager {
                 String containerIp = waitForContainerBridgeIp(containerId, instanceId);
                 if (containerIp != null && !containerIp.isBlank()) {
                     instance.setContainerBridgeIp(containerIp);
-                    exposeReachablePrivateAddress(instance, containerIp);
+                    exposeReachablePrivateAddress(instance, containerIp, config.services().ec2().awsFaithfulPrivateIp());
                     metadataServer.registerContainer(containerIp, instanceId, instance);
                 }
                 else {
@@ -204,9 +206,14 @@ public class Ec2ContainerManager {
 
                 configureLinkLocalMetadataEndpoint(containerId, instanceId, flociHost, imdsPort);
 
-                // Set public-facing addresses
-                instance.setPublicIpAddress("127.0.0.1");
-                instance.setPublicDnsName("localhost");
+                // Set public-facing addresses only for instances whose subnet
+                // opts in via MapPublicIpOnLaunch (#1984). Private-subnet
+                // instances have no public IP/DNS, matching real EC2. The value
+                // stays the host-reachable 127.0.0.1/localhost for public ones.
+                if (instance.isAssociatePublicIp()) {
+                    instance.setPublicIpAddress("127.0.0.1");
+                    instance.setPublicDnsName("localhost");
+                }
 
                 instance.setState(InstanceState.running());
                 LOG.infov("EC2 instance {0} running in container {1} (SSH host port {2})",
@@ -316,7 +323,7 @@ public class Ec2ContainerManager {
                 String containerIp = waitForContainerBridgeIp(containerId, instanceId);
                 if (containerIp != null && !containerIp.isBlank()) {
                     instance.setContainerBridgeIp(containerIp);
-                    exposeReachablePrivateAddress(instance, containerIp);
+                    exposeReachablePrivateAddress(instance, containerIp, config.services().ec2().awsFaithfulPrivateIp());
                     metadataServer.registerContainer(containerIp, instanceId, instance);
                 }
             } catch (InterruptedException e) {
@@ -356,13 +363,27 @@ public class Ec2ContainerManager {
             metadataServer.unregisterContainer(previousContainerIp, instance);
         }
         instance.setContainerBridgeIp(containerIp);
-        exposeReachablePrivateAddress(instance, containerIp);
+        exposeReachablePrivateAddress(instance, containerIp, config.services().ec2().awsFaithfulPrivateIp());
         metadataServer.registerContainer(containerIp, instance.getInstanceId(), instance);
         return true;
     }
 
     static void exposeReachablePrivateAddress(Instance instance, String privateIp) {
+        exposeReachablePrivateAddress(instance, privateIp, false);
+    }
+
+    /**
+     * Overwrite the instance's reported private address with the container's
+     * reachable bridge IP — unless {@code awsFaithful} is true (#1983), in which
+     * case the CFN/subnet-allocated private IP set at launch is left untouched.
+     * The container bridge IP is tracked separately (setContainerBridgeIp) and
+     * used for routing/IMDS regardless of this flag.
+     */
+    static void exposeReachablePrivateAddress(Instance instance, String privateIp, boolean awsFaithful) {
         if (instance == null || privateIp == null || privateIp.isBlank()) {
+            return;
+        }
+        if (awsFaithful) {
             return;
         }
 
@@ -467,12 +488,12 @@ public class Ec2ContainerManager {
             // was never installed while still logging success.
             ContainerExecResult install = execInContainerForResult(containerId, new String[]{"sh", "-c",
                     "if ! command -v sshd >/dev/null 2>&1; then" +
-                    "  if command -v dnf >/dev/null 2>&1; then dnf install -y openssh-server >/dev/null 2>&1;" +
-                    "  elif command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >/dev/null 2>&1;" +
-                    "  elif command -v apk >/dev/null 2>&1; then apk add --no-cache openssh >/dev/null 2>&1;" +
-                    "  fi;" +
-                    "fi;" +
-                    "command -v sshd >/dev/null 2>&1"}, 120);
+                            "  if command -v dnf >/dev/null 2>&1; then dnf install -y openssh-server >/dev/null 2>&1;" +
+                            "  elif command -v apt-get >/dev/null 2>&1; then DEBIAN_FRONTEND=noninteractive apt-get install -y openssh-server >/dev/null 2>&1;" +
+                            "  elif command -v apk >/dev/null 2>&1; then apk add --no-cache openssh >/dev/null 2>&1;" +
+                            "  fi;" +
+                            "fi;" +
+                            "command -v sshd >/dev/null 2>&1"}, 120);
             if (install.exitCode() != 0) {
                 LOG.warnv("Could not install openssh-server for EC2 instance {0}: {1}",
                         instanceId, install.summary());
@@ -485,15 +506,17 @@ public class Ec2ContainerManager {
                         instanceId, keygen.summary());
                 return;
             }
-            // Start sshd without -D so it daemonizes itself and survives this exec session. Resolved
-            // via PATH (like ssh-keygen above) rather than hardcoded to /usr/sbin/sshd, since not
-            // every image installs it to that exact path.
-            ContainerExecResult start = execInContainerForResult(containerId, new String[]{"sshd"}, 5);
-            if (start.exitCode() != 0) {
-                LOG.warnv("Could not start sshd for EC2 instance {0}: {1}", instanceId, start.summary());
+            // Start sshd without -D so it daemonizes itself and survives this exec session. Since sshd
+            // requires execution with an absolute path, several paths are tried until it starts
+            for (String sshdPath : ALLOWED_SSHD_PATHS) {
+                ContainerExecResult start = execInContainerForResult(containerId, new String[]{sshdPath}, 5);
+                if (start.exitCode() != 0) {
+                    LOG.warnv("Could not start sshd using path {0} for EC2 instance {1}: {2}", sshdPath, instanceId, start.summary());
+                    continue;
+                }
+                LOG.infov("Started sshd in EC2 instance {0}", instanceId);
                 return;
             }
-            LOG.infov("Started sshd in EC2 instance {0}", instanceId);
         } catch (Exception e) {
             LOG.warnv("Could not start sshd in EC2 instance {0}: {1}", instanceId, e.getMessage());
         }
@@ -513,8 +536,8 @@ public class Ec2ContainerManager {
             // Execute the script and stream output to CloudWatch
             for (int i = 0; i < shellScripts.size(); i++) {
                 executeUserDataShellScript(
-                    containerId, instanceId, shellScripts.get(i), i + 1, shellScripts.size(),
-                    logGroup, logStream, region
+                        containerId, instanceId, shellScripts.get(i), i + 1, shellScripts.size(),
+                        logGroup, logStream, region
                 );
             }
         } catch (Exception e) {
@@ -523,8 +546,8 @@ public class Ec2ContainerManager {
     }
 
     private void executeUserDataShellScript(
-        String containerId, String instanceId, String scriptContent, int partNumber, int partCount,
-        String logGroup, String logStream, String region
+            String containerId, String instanceId, String scriptContent, int partNumber, int partCount,
+            String logGroup, String logStream, String region
     ) throws Exception {
         byte[] script = scriptContent.getBytes(StandardCharsets.UTF_8);
         byte[] tar = buildSingleFileTar("user-data.sh", script, 0755);
