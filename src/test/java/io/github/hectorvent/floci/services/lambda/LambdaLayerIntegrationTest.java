@@ -78,7 +78,8 @@ class LambdaLayerIntegrationTest {
             .body("Content.CodeSize", greaterThan(0))
             .body("Content.CodeSha256", not(emptyString()))
             .body("Content.Location", containsString("awslambda-us-east-1-tasks/layers/"))
-            .body("Content.Location", endsWith("/" + LAYER_NAME + "/1"))
+            .body("Content.Location", endsWith("/" + LAYER_NAME
+                    + "/1?X-Amz-Credential=000000000000%2F00010101%2Fus-east-1%2Fs3%2Faws4_request"))
             .body("CreatedDate", not(emptyString()));
     }
 
@@ -318,6 +319,41 @@ class LambdaLayerIntegrationTest {
             .get("/awslambda-us-east-1-tasks/layers/000000000000/" + LAYER_NAME + "/1")
         .then()
             .statusCode(404);
+    }
+
+    @Test
+    @Order(19)
+    void contentLocation_ofNonDefaultAccountLayer_isFetchable() throws Exception {
+        // The Location URL is fetched unsigned, so it must carry the owning account in
+        // X-Amz-Credential. Without it the download resolves the default account's
+        // bucket namespace and 404s for a layer published under another account.
+        String location = given()
+            .header("Authorization", "AWS4-HMAC-SHA256 Credential=000000000001/20260215/us-east-1/lambda/aws4_request, SignedHeaders=host, Signature=abc")
+            .contentType("application/json")
+            .body("""
+                { "Content": { "ZipFile": "%s" } }
+                """.formatted(layerZipBase64()))
+        .when()
+            .post("/2018-10-31/layers/" + LAYER_NAME + "-alt/versions")
+        .then()
+            .statusCode(201)
+            .body("Content.Location", containsString("/layers/000000000001/"))
+            .body("Content.Location", containsString("X-Amz-Credential=000000000001%2F"))
+            .extract().path("Content.Location");
+
+        given()
+            .urlEncodingEnabled(false)
+        .when()
+            .get(location)
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("Authorization", "AWS4-HMAC-SHA256 Credential=000000000001/20260215/us-east-1/lambda/aws4_request, SignedHeaders=host, Signature=abc")
+        .when()
+            .delete("/2018-10-31/layers/" + LAYER_NAME + "-alt/versions/1")
+        .then()
+            .statusCode(204);
     }
 
     // ── PublishLayerVersion validation ────────────────────────────────────────

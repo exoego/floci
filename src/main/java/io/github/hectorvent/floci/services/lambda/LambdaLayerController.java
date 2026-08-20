@@ -160,18 +160,21 @@ public class LambdaLayerController {
      * built from the request so it targets the same endpoint the client is talking to.
      * Segments are percent-encoded directly rather than through {@code UriBuilder.path},
      * whose template syntax would throw on a layer name containing braces.
+     * Clients fetch this URL unsigned, so an {@code X-Amz-Credential} query steers
+     * Floci's account filter to the layer's owning account; without it a layer owned
+     * by a non-default account resolves the default-account bucket and 404s.
      */
     private String tasksLocation(LambdaLayerVersion lv, String region, UriInfo uriInfo) {
         var base = uriInfo.getBaseUri().toString();
         if (base.endsWith("/")) {
             base = base.substring(0, base.length() - 1);
         }
+        var account = AwsArnUtils.accountOrDefault(lv.getLayerVersionArn(), "000000000000");
         var bucket = LambdaService.tasksBucketName(region);
-        var key = LambdaService.layerObjectKey(
-                AwsArnUtils.accountOrDefault(lv.getLayerVersionArn(), "000000000000"),
-                lv.getLayerName(), lv.getVersion());
+        var key = LambdaService.layerObjectKey(account, lv.getLayerName(), lv.getVersion());
         return base + "/" + LambdaService.encodeObjectPath(bucket)
-                + "/" + LambdaService.encodeObjectPath(key);
+                + "/" + LambdaService.encodeObjectPath(key)
+                + "?X-Amz-Credential=" + account + "%2F00010101%2F" + region + "%2Fs3%2Faws4_request";
     }
 
     private ObjectNode buildLayerVersionSummary(LambdaLayerVersion lv) {
