@@ -4,6 +4,8 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerHandle;
 import io.github.hectorvent.floci.services.elasticache.container.ElastiCacheContainerManager;
 import io.github.hectorvent.floci.services.elasticache.model.AuthMode;
@@ -58,7 +60,9 @@ class ElastiCacheServiceTest {
                 .thenReturn(new ElastiCacheContainerHandle("cid", "grp", "localhost", 6379));
         doNothing().when(proxyManager).startProxy(anyString(), any(), anyInt(), anyString(), anyInt(), any());
 
-        service = new ElastiCacheService(containerManager, proxyManager, storageFactory, config);
+        Ec2Service ec2Service = org.mockito.Mockito.mock(Ec2Service.class);
+        service = new ElastiCacheService(containerManager, proxyManager, storageFactory, config,
+                ec2Service, new RegionResolver("us-east-1", "000000000000"));
     }
 
     @Test

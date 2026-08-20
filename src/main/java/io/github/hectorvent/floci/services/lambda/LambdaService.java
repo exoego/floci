@@ -72,6 +72,7 @@ public class LambdaService {
     private final KinesisEventSourcePoller kinesisPoller;
     private final DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller;
     private final StorageFactory storageFactory;
+    private final LambdaLayerService layerService;
     private Map<String, Integer> versionCounters = new ConcurrentHashMap<>();
     private Map<String, FunctionEventInvokeConfig> eventInvokeConfigs = new ConcurrentHashMap<>();
     /**
@@ -139,6 +140,7 @@ public class LambdaService {
         this.kinesisPoller = null;
         this.dynamodbStreamsPoller = null;
         this.storageFactory = storageFactory;
+        this.layerService = null;
     }
 
     @Inject
@@ -157,7 +159,8 @@ public class LambdaService {
                           SqsEventSourcePoller poller,
                           KinesisEventSourcePoller kinesisPoller,
                           DynamoDbStreamsEventSourcePoller dynamodbStreamsPoller,
-                          StorageFactory storageFactory) {
+                          StorageFactory storageFactory,
+                          LambdaLayerService layerService) {
         this.functionStore = functionStore;
         this.executorService = executorService;
         this.concurrencyLimiter = concurrencyLimiter;
@@ -174,6 +177,23 @@ public class LambdaService {
         this.kinesisPoller = kinesisPoller;
         this.dynamodbStreamsPoller = dynamodbStreamsPoller;
         this.storageFactory = storageFactory;
+        this.layerService = layerService;
+    }
+
+    // Real AWS validates a function's Layers eagerly at CreateFunction/UpdateFunctionConfiguration
+    // time with InvalidParameterValueException, not lazily at invoke time - resolveLayerByArn's
+    // caller in ContainerLauncher only logs a warning and silently launches without the layer's
+    // content mounted, which is correct AWS-parity behavior for a layer deleted *after* being
+    // attached (AWS doesn't re-validate on every invoke either), but was previously the only
+    // signal at all for a bad ARN, even a typo caught at attach time on real AWS.
+    private void validateLayersResolvable(List<String> layerArns) {
+        if (layerArns == null || layerService == null) return;
+        for (String arn : layerArns) {
+            if (layerService.resolveLayerByArn(arn) == null) {
+                throw new AwsException("InvalidParameterValueException",
+                        "Layer version " + arn + " does not exist.", 400);
+            }
+        }
     }
 
     /** Package-private accessor for tests that want to assert limiter state directly. */
@@ -321,6 +341,7 @@ public class LambdaService {
         List<String> layers = request.get("Layers") instanceof List
                 ? (List<String>) request.get("Layers") : null;
         if (layers != null) {
+            validateLayersResolvable(layers);
             fn.setLayers(new ArrayList<>(layers));
         }
 
@@ -463,6 +484,18 @@ public class LambdaService {
     public LambdaFunction updateFunctionConfiguration(String region, String functionName, Map<String, Object> request) {
         LambdaFunction fn = getFunction(region, functionName);
 
+        // Validated before any field mutation below, not inline where Layers is applied further
+        // down - fn is the live object backing this store entry (InMemoryStorage#get returns the
+        // same reference, not a copy), so validating this late would leave every
+        // already-applied field (Description, Timeout, ...) live on a rejected update, since
+        // nothing here is transactional and there's a single save() at the very end.
+        @SuppressWarnings("unchecked")
+        List<String> layerList = request.containsKey("Layers") && request.get("Layers") instanceof List
+                ? (List<String>) request.get("Layers") : null;
+        if (request.containsKey("Layers")) {
+            validateLayersResolvable(layerList);
+        }
+
         Map<String, Object> requestedVpcConfig = fn.getVpcConfig();
         if (request.get("VpcConfig") instanceof Map<?, ?>) {
             @SuppressWarnings("unchecked")
@@ -545,9 +578,6 @@ public class LambdaService {
         }
 
         if (request.containsKey("Layers")) {
-            @SuppressWarnings("unchecked")
-            List<String> layerList = request.get("Layers") instanceof List
-                    ? (List<String>) request.get("Layers") : null;
             fn.setLayers(layerList != null ? new ArrayList<>(layerList) : new ArrayList<>());
         }
 
@@ -639,7 +669,24 @@ public class LambdaService {
         enforceRegion(region, ref);
         String name = ref.name();
         String qualifier = ref.qualifier();
-        LambdaFunction fn = resolveInvokeTarget(region, name, qualifier);
+        LambdaFunction fn;
+        if (functionName.startsWith("arn:")) {
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(functionName);
+            fn = resolveInvokeTargetForAccount(arn.accountId(), region, name, qualifier);
+        } else {
+            fn = resolveInvokeTarget(region, name, qualifier);
+        }
+        InvokeResult result = executorService.invoke(fn, payload, type);
+        result.setExecutedVersion(fn.getVersion());
+        return result;
+    }
+
+    /** Invokes a Lambda target ARN using the account encoded in that ARN. */
+    public InvokeResult invokeArn(String functionArn, byte[] payload, InvocationType type) {
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(functionArn);
+        LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolve(functionArn);
+        LambdaFunction fn = resolveInvokeTargetForAccount(
+                arn.accountId(), arn.region(), ref.name(), ref.qualifier());
         InvokeResult result = executorService.invoke(fn, payload, type);
         result.setExecutedVersion(fn.getVersion());
         return result;
@@ -663,6 +710,37 @@ public class LambdaService {
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Function not found: " + name, 404));
         }
         return functionStore.get(region, name, version)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "Function version not found: " + name + ":" + version, 404));
+    }
+
+    private LambdaFunction resolveInvokeTargetForAccount(
+            String accountId, String region, String name, String qualifier) {
+        if (qualifier == null || qualifier.equals("$LATEST")) {
+            return functionStore.getForAccount(accountId, region, name)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Function not found: " + name, 404));
+        }
+        if (qualifier.chars().allMatch(Character::isDigit)) {
+            return functionStore.getForAccount(accountId, region, name, qualifier)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Function version not found: " + name + ":" + qualifier, 404));
+        }
+        LambdaAlias alias = aliasStore != null
+                ? aliasStore.getForAccount(accountId, region, name, qualifier)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Alias not found: " + qualifier, 404))
+                : null;
+        if (alias == null) {
+            throw new AwsException("ResourceNotFoundException", "Alias not found: " + qualifier, 404);
+        }
+        String version = pickAliasVersion(alias);
+        if (version == null || version.equals("$LATEST")) {
+            return functionStore.getForAccount(accountId, region, name)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Function not found: " + name, 404));
+        }
+        return functionStore.getForAccount(accountId, region, name, version)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                         "Function version not found: " + name + ":" + version, 404));
     }
@@ -745,6 +823,8 @@ public class LambdaService {
 
         EventSourceMapping.DestinationConfig destinationConfig = parseDestinationConfig(request);
 
+        StartingPositionSpec startingPosition = parseStartingPosition(request, eventSourceArn);
+
         String queueUrl = eventSourceArn.contains(":sqs:") ? AwsArnUtils.arnToQueueUrl(eventSourceArn, config.effectiveBaseUrl()) : null;
 
         EventSourceMapping esm = new EventSourceMapping();
@@ -762,6 +842,8 @@ public class LambdaService {
         esm.setFunctionResponseTypes(functionResponseTypes);
         esm.setBisectBatchOnFunctionError(bisectBatchOnFunctionError);
         esm.setDestinationConfig(destinationConfig);
+        esm.setStartingPosition(startingPosition.position());
+        esm.setStartingPositionTimestamp(startingPosition.timestampMillis());
         esm.setLastModified(System.currentTimeMillis());
 
         esmStore.save(esm);
@@ -802,6 +884,55 @@ public class LambdaService {
         EventSourceMapping.DestinationConfig destinationConfig = new EventSourceMapping.DestinationConfig();
         destinationConfig.setOnFailure(onFailure);
         return destinationConfig;
+    }
+
+    /** A validated {@code StartingPosition} plus, for {@code AT_TIMESTAMP}, its epoch-millis instant. */
+    private record StartingPositionSpec(String position, Long timestampMillis) {}
+
+    /**
+     * Parses {@code StartingPosition}/{@code StartingPositionTimestamp} out of a create request.
+     *
+     * <p>Absent means absent: AWS requires a starting position for stream event sources, but Floci
+     * has always accepted mappings without one (its pollers default to reading from the trim
+     * horizon), so this validates only what a caller actually sent rather than newly rejecting
+     * requests that used to succeed. There is no update counterpart because AWS's
+     * UpdateEventSourceMapping does not accept the field at all - it is replace-only.
+     */
+    private StartingPositionSpec parseStartingPosition(Map<String, Object> request, String eventSourceArn) {
+        Object raw = request.get("StartingPosition");
+        if (raw == null) {
+            return new StartingPositionSpec(null, null);
+        }
+        if (!(raw instanceof String position) || position.isBlank()) {
+            throw new AwsException("InvalidParameterValueException",
+                    "StartingPosition must be one of TRIM_HORIZON, LATEST, AT_TIMESTAMP", 400);
+        }
+        if (!"TRIM_HORIZON".equals(position) && !"LATEST".equals(position) && !"AT_TIMESTAMP".equals(position)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "StartingPosition must be one of TRIM_HORIZON, LATEST, AT_TIMESTAMP (got " + position + ")", 400);
+        }
+        if (!"AT_TIMESTAMP".equals(position)) {
+            return new StartingPositionSpec(position, null);
+        }
+        // AT_TIMESTAMP is Kinesis-only among the event sources Floci supports - DynamoDB Streams
+        // shard iterators have no timestamp form at all, so silently accepting it there would
+        // promise a starting point that can never be honoured.
+        if (eventSourceArn != null && !eventSourceArn.contains(":kinesis:")) {
+            throw new AwsException("InvalidParameterValueException",
+                    "AT_TIMESTAMP is only supported for Amazon Kinesis event sources", 400);
+        }
+        Object rawTimestamp = request.get("StartingPositionTimestamp");
+        if (rawTimestamp == null) {
+            throw new AwsException("InvalidParameterValueException",
+                    "StartingPositionTimestamp is required when StartingPosition is AT_TIMESTAMP", 400);
+        }
+        if (!(rawTimestamp instanceof Number timestamp)) {
+            throw new AwsException("InvalidParameterValueException",
+                    "StartingPositionTimestamp must be a numeric epoch-seconds value", 400);
+        }
+        // Lambda speaks restJson1, whose timestamps are (possibly fractional) epoch seconds - the
+        // same convention buildEsmResponse already uses for LastModified on the way back out.
+        return new StartingPositionSpec(position, Math.round(timestamp.doubleValue() * 1000.0));
     }
 
     /**
@@ -1157,7 +1288,12 @@ public class LambdaService {
             urlConfig.setInvokeMode((String) request.get("InvokeMode"));
         }
 
-        String urlId = UUID.nameUUIDFromBytes((region + functionName + (qualifier != null ? qualifier : "")).getBytes()).toString().replace("-", "").substring(0, 32);
+        String accountId = regionResolver.getAccountId();
+        String urlId = UUID.nameUUIDFromBytes(
+                        (accountId + region + functionName + (qualifier != null ? qualifier : "")).getBytes())
+                .toString()
+                .replace("-", "")
+                .substring(0, 32);
         String baseHost = config.effectiveBaseUrl().replaceFirst("https?://", "");
         String url = String.format("http://%s.lambda-url.%s.%s/", urlId, region, baseHost);
         urlConfig.setFunctionUrl(url);

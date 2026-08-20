@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.cloudformation;
 
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.testing.MutableClock;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
@@ -19,6 +20,11 @@ import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Base64;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 import static io.restassured.RestAssured.given;
@@ -4182,6 +4188,154 @@ class CloudFormationIntegrationTest {
     }
 
     @Test
+    void createStack_lambdaEventSourceMappingWithStartingPosition() {
+        String stackName = "cfn-esm-starting-position-stack";
+        String funcName = "cfn-esm-starting-position-func";
+        String streamName = "cfn-esm-starting-position-stream";
+
+        String template = """
+            {
+              "Resources": {
+                "MyStream": {
+                  "Type": "AWS::Kinesis::Stream",
+                  "Properties": {
+                    "Name": "%s",
+                    "ShardCount": 1
+                  }
+                },
+                "MyFunction": {
+                  "Type": "AWS::Lambda::Function",
+                  "Properties": {
+                    "FunctionName": "%s",
+                    "Runtime": "nodejs20.x",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                    "Code": {
+                      "ZipFile": "exports.handler = async (e) => ({ statusCode: 200 });"
+                    }
+                  }
+                },
+                "MyESM": {
+                  "Type": "AWS::Lambda::EventSourceMapping",
+                  "Properties": {
+                    "FunctionName": { "Ref": "MyFunction" },
+                    "EventSourceArn": { "Fn::GetAtt": ["MyStream", "Arn"] },
+                    "StartingPosition": "AT_TIMESTAMP",
+                    "StartingPositionTimestamp": 1787036486.712,
+                    "BatchSize": 5
+                  }
+                }
+              }
+            }
+            """.formatted(streamName, funcName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackId>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+
+        // The whole point of this test: StartingPosition/StartingPositionTimestamp must survive
+        // the CFN -> Lambda plumbing, not just the direct-API path EsmIntegrationTest covers.
+        given()
+        .when()
+            .get("/2015-03-31/event-source-mappings?FunctionName=" + funcName)
+        .then()
+            .statusCode(200)
+            .body("EventSourceMappings[0].StartingPosition", equalTo("AT_TIMESTAMP"))
+            .body("EventSourceMappings[0].StartingPositionTimestamp", equalTo(1787036486.712f));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    void createStack_lambdaEventSourceMappingWithNonFiniteStartingPositionTimestampFailsResource() {
+        String stackName = "cfn-esm-nonfinite-timestamp-stack";
+        String funcName = "cfn-esm-nonfinite-timestamp-func";
+        String streamName = "cfn-esm-nonfinite-timestamp-stream";
+
+        // "NaN" is passed as a JSON string since JSON itself has no NaN/Infinity literal;
+        // Double.parseDouble happily accepts it, which is exactly what the isFinite guard exists to catch.
+        String template = """
+            {
+              "Resources": {
+                "MyStream": {
+                  "Type": "AWS::Kinesis::Stream",
+                  "Properties": {
+                    "Name": "%s",
+                    "ShardCount": 1
+                  }
+                },
+                "MyFunction": {
+                  "Type": "AWS::Lambda::Function",
+                  "Properties": {
+                    "FunctionName": "%s",
+                    "Runtime": "nodejs20.x",
+                    "Handler": "index.handler",
+                    "Role": "arn:aws:iam::000000000000:role/lambda-role",
+                    "Code": {
+                      "ZipFile": "exports.handler = async (e) => ({ statusCode: 200 });"
+                    }
+                  }
+                },
+                "MyESM": {
+                  "Type": "AWS::Lambda::EventSourceMapping",
+                  "Properties": {
+                    "FunctionName": { "Ref": "MyFunction" },
+                    "EventSourceArn": { "Fn::GetAtt": ["MyStream", "Arn"] },
+                    "StartingPosition": "AT_TIMESTAMP",
+                    "StartingPositionTimestamp": "NaN",
+                    "BatchSize": 5
+                  }
+                }
+              }
+            }
+            """.formatted(streamName, funcName);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackResources")
+            .formParam("StackName", stackName)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body(containsString("CREATE_FAILED"));
+    }
+
+    @Test
     void crossStackReference_fnImportValue() {
         // Stack A exports a bucket name
         String templateA = """
@@ -6060,12 +6214,12 @@ class CloudFormationIntegrationTest {
                       "Properties": {
                         "GroupName": "%s",
                         "GroupDescription": "Security group created by CloudFormation",
-                        "VpcId": "vpc-default"
+                        "VpcId": "%s"
                       }
                     }
                   }
                 }
-                """.formatted(groupName);
+                """.formatted(groupName, Ec2Service.defaultVpcId("us-east-1"));
 
         given()
                 .formParam("Action", "CreateStack")
@@ -6223,7 +6377,7 @@ class CloudFormationIntegrationTest {
                     "Name": "cfn-alb",
                     "Type": "application",
                     "Scheme": "internet-facing",
-                    "Subnets": ["subnet-default-a", "subnet-default-b"],
+                    "Subnets": ["%s", "%s"],
                     "SecurityGroups": ["sg-123"]
                   }
                 },
@@ -6233,7 +6387,7 @@ class CloudFormationIntegrationTest {
                     "Name": "cfn-tg",
                     "Protocol": "HTTP",
                     "Port": 80,
-                    "VpcId": "vpc-default",
+                    "VpcId": "%s",
                     "TargetType": "ip",
                     "HealthCheckPath": "/health",
                     "Matcher": { "HttpCode": "200-299" }
@@ -6276,7 +6430,8 @@ class CloudFormationIntegrationTest {
                 "RuleRef": { "Value": { "Ref": "Rule" } }
               }
             }
-            """;
+            """.formatted(Ec2Service.defaultSubnetId("us-east-1", "a"), Ec2Service.defaultSubnetId("us-east-1", "b"),
+                Ec2Service.defaultVpcId("us-east-1"));
 
         String stackName = "cfn-elbv2-stack";
 
@@ -9503,6 +9658,401 @@ class CloudFormationIntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("CREATE_FAILED"));
+    }
+
+    @Test
+    void createStack_onExistingActiveStack_throwsAlreadyExistsException() {
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2207-active-bus" } }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-2207-active-stack")
+            .formParam("TemplateBody", template)
+        .when().post("/").then().statusCode(200);
+
+        // A second CreateStack for the same name, while the first is still ACTIVE, is a real
+        // conflict - it must not silently re-run the template against the live stack.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", "cfn-2207-active-stack")
+            .formParam("TemplateBody", template)
+        .when().post("/")
+        .then()
+            .body(containsString("AlreadyExistsException"))
+            .body(containsString("already exists"));
+    }
+
+    @Test
+    void createStack_concurrentRequestsForUnusedName_exactlyOneSucceeds() throws InterruptedException {
+        // The existence check and the stack-map insert used to be two separate operations, so two
+        // requests racing for the same never-before-used name could both observe "absent" and then
+        // share whichever Stack computeIfAbsent settled on, each independently executing the
+        // template - duplicate provisioning instead of one AlreadyExistsException. Verifies the
+        // check-and-insert is now atomic.
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2207-concurrent-bus" } }
+              }
+            }
+            """;
+        String stackName = "cfn-2207-concurrent-stack";
+        int attempts = 16;
+
+        CountDownLatch ready = new CountDownLatch(attempts);
+        CountDownLatch go = new CountDownLatch(1);
+        AtomicInteger succeeded = new AtomicInteger();
+        AtomicInteger conflicted = new AtomicInteger();
+        ExecutorService pool = Executors.newFixedThreadPool(attempts);
+        try {
+            for (int i = 0; i < attempts; i++) {
+                pool.submit(() -> {
+                    ready.countDown();
+                    try {
+                        go.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    String body = given()
+                        .contentType("application/x-www-form-urlencoded")
+                        .formParam("Action", "CreateStack")
+                        .formParam("StackName", stackName)
+                        .formParam("TemplateBody", template)
+                    .when().post("/").then().extract().asString();
+                    if (body.contains("AlreadyExistsException")) {
+                        conflicted.incrementAndGet();
+                    } else if (body.contains("<StackId>")) {
+                        succeeded.incrementAndGet();
+                    }
+                });
+            }
+            assertTrue(ready.await(10, TimeUnit.SECONDS), "workers failed to line up in time");
+            go.countDown();
+        } finally {
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "requests did not finish in time");
+        }
+
+        assertEquals(1, succeeded.get(), "exactly one CreateStack should have won the race");
+        assertEquals(attempts - 1, conflicted.get(), "every other request should see AlreadyExistsException");
+    }
+
+    @Test
+    void createStack_onRollbackCompleteStack_alsoThrowsAlreadyExistsException() {
+        // #2207: a stack whose first CREATE fails ends in ROLLBACK_COMPLETE and stays fully
+        // describable - it is not deleted eagerly at rollback time. Matching real AWS,
+        // ROLLBACK_COMPLETE is still a real conflict for CreateStack: an explicit DeleteStack is
+        // required before the name can be reused (verified against AWS's own CreateStack API
+        // reference and troubleshooting docs, which list AlreadyExists unconditionally - there is
+        // no ROLLBACK_COMPLETE carve-out).
+        String failingTemplate = """
+            {
+              "Resources": {
+                "BadSecret": {
+                  "Type": "AWS::SecretsManager::Secret",
+                  "Properties": {
+                    "Name": "cfn-2207-redeploy-secret",
+                    "SecretString": "explicit",
+                    "GenerateSecretString": { "PasswordLength": 32 }
+                  }
+                }
+              }
+            }
+            """;
+        String stackName = "cfn-2207-redeploy-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", failingTemplate)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when().post("/")
+        .then().statusCode(200).body(containsString("<StackStatus>ROLLBACK_COMPLETE</StackStatus>"));
+
+        // A second CreateStack still conflicts - the diagnostic is preserved, not silently
+        // superseded.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", failingTemplate)
+        .when().post("/")
+        .then().body(containsString("AlreadyExistsException"));
+
+        // The failed attempt's diagnostic is still readable after that rejected retry.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStackEvents")
+            .formParam("StackName", stackName)
+        .when().post("/")
+        .then().statusCode(200).body(containsString("CREATE_FAILED"));
+
+        // An explicit DeleteStack, though, clears the way for a fresh CreateStack - matching the
+        // issue's suggested fix: "let DeleteStack remove it."
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DeleteStack")
+            .formParam("StackName", stackName)
+        .when().post("/").then().statusCode(200);
+
+        String workingTemplate = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2207-redeploy-bus" } }
+              }
+            }
+            """;
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", workingTemplate)
+        .when().post("/").then().statusCode(200).body(containsString("<StackId>"));
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when().post("/")
+        .then().statusCode(200).body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+    }
+
+    @Test
+    void createChangeSet_secondCreateTypeBeforeExecution_attachesToReviewInProgressStack() {
+        // `aws cloudformation deploy` (and SAM, which shares the code) treats a REVIEW_IN_PROGRESS
+        // stack as nonexistent - see has_stack in the AWS CLI's deployer.py - and sends another
+        // CREATE change set against it, which real CloudFormation accepts: a CREATE change set
+        // leaves the stack in REVIEW_IN_PROGRESS until somebody executes it, so it is a placeholder
+        // rather than a deployment to conflict with. Retrying a failed `deploy` before any execute
+        // must therefore not hit AlreadyExistsException.
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2365-review-bus" } }
+              }
+            }
+            """;
+        String stackName = "cfn-2365-review-stack";
+
+        String firstStackId = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-1")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/")
+        .then().statusCode(200).extract().path("CreateChangeSetResponse.CreateChangeSetResult.StackId");
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when().post("/")
+        .then().statusCode(200).body(containsString("<StackStatus>REVIEW_IN_PROGRESS</StackStatus>"));
+
+        // The retry: same name, still nothing executed. It attaches to the placeholder rather than
+        // conflicting with it, and lands on the same stack rather than creating a second one.
+        String secondStackId = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-2")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/")
+        .then()
+            .statusCode(200)
+            .body(not(containsString("AlreadyExistsException")))
+            .extract().path("CreateChangeSetResponse.CreateChangeSetResult.StackId");
+
+        assertEquals(firstStackId, secondStackId, "the retry should attach to the same placeholder stack");
+
+        // Executing the retry's change set still deploys normally.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ExecuteChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-2")
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "DescribeStacks")
+            .formParam("StackName", stackName)
+        .when().post("/")
+        .then().statusCode(200).body(containsString("<StackStatus>CREATE_COMPLETE</StackStatus>"));
+    }
+
+    @Test
+    void createChangeSet_createTypeAfterExecution_stillThrowsAlreadyExistsException() {
+        // The exemption is narrow: it covers a stack that never left REVIEW_IN_PROGRESS. Once the
+        // change set has been executed the stack is a real deployment, and a further CREATE change
+        // set is the ordinary name conflict again.
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2365-executed-bus" } }
+              }
+            }
+            """;
+        String stackName = "cfn-2365-executed-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-1")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ExecuteChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-1")
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "deploy-attempt-2")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/")
+        .then().body(containsString("AlreadyExistsException"));
+    }
+
+    @Test
+    void createChangeSet_concurrentRequestsOnSamePlaceholder_keepEveryChangeSet() throws InterruptedException {
+        // Two requests are allowed to share one stack - two CREATE change sets attaching to the
+        // same REVIEW_IN_PROGRESS placeholder, or two UPDATE change sets on a live stack. Stack's
+        // changeSets is a plain LinkedHashMap, so recording the change set has to happen inside the
+        // same per-key lock that resolves the stack; done afterwards, concurrent writers lose an
+        // accepted change set or corrupt the map.
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2365-parallel-bus" } }
+              }
+            }
+            """;
+        String stackName = "cfn-2365-parallel-stack";
+        int attempts = 16;
+
+        // Establish the placeholder first, so every racing request takes the "attach" path.
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "seed")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/").then().statusCode(200);
+
+        CountDownLatch ready = new CountDownLatch(attempts);
+        CountDownLatch go = new CountDownLatch(1);
+        AtomicInteger accepted = new AtomicInteger();
+        ExecutorService pool = Executors.newFixedThreadPool(attempts);
+        try {
+            for (int i = 0; i < attempts; i++) {
+                String changeSetName = "parallel-" + i;
+                pool.submit(() -> {
+                    ready.countDown();
+                    try {
+                        go.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return;
+                    }
+                    String body = given()
+                        .contentType("application/x-www-form-urlencoded")
+                        .formParam("Action", "CreateChangeSet")
+                        .formParam("StackName", stackName)
+                        .formParam("ChangeSetName", changeSetName)
+                        .formParam("ChangeSetType", "CREATE")
+                        .formParam("TemplateBody", template)
+                    .when().post("/").then().extract().asString();
+                    if (body.contains("<StackId>")) {
+                        accepted.incrementAndGet();
+                    }
+                });
+            }
+            assertTrue(ready.await(10, TimeUnit.SECONDS), "workers failed to line up in time");
+            go.countDown();
+        } finally {
+            pool.shutdown();
+            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "requests did not finish in time");
+        }
+
+        assertEquals(attempts, accepted.get(), "every CREATE change set on the placeholder should be accepted");
+
+        // Every accepted change set must still be readable - an acknowledged write that vanished
+        // from the map is exactly the failure this guards.
+        String listed = given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "ListChangeSets")
+            .formParam("StackName", stackName)
+        .when().post("/").then().statusCode(200).extract().asString();
+
+        for (int i = 0; i < attempts; i++) {
+            assertTrue(listed.contains("parallel-" + i), "change set parallel-" + i + " was lost");
+        }
+        assertTrue(listed.contains("seed"), "the seed change set was lost");
+    }
+
+    @Test
+    void createStack_onReviewInProgressStack_throwsAlreadyExistsException() {
+        // CreateStack does not get the REVIEW_IN_PROGRESS exemption, and must not: every stack it
+        // creates is REVIEW_IN_PROGRESS for the window between newStack() and the execute that
+        // immediately follows, so exempting the status on this path would let two racing
+        // CreateStack requests share one stack and both provision the template - the very race
+        // createStack_concurrentRequestsForUnusedName_exactlyOneSucceeds covers. LocalStack draws
+        // the same line: its create_stack conflicts on any status but DELETE_COMPLETE, while only
+        // its create_change_set exempts REVIEW_IN_PROGRESS.
+        String template = """
+            {
+              "Resources": {
+                "MyBus": { "Type": "AWS::Events::EventBus", "Properties": { "Name": "cfn-2365-implicit-bus" } }
+              }
+            }
+            """;
+        String stackName = "cfn-2365-implicit-stack";
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateChangeSet")
+            .formParam("StackName", stackName)
+            .formParam("ChangeSetName", "pending")
+            .formParam("ChangeSetType", "CREATE")
+            .formParam("TemplateBody", template)
+        .when().post("/").then().statusCode(200);
+
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", "CreateStack")
+            .formParam("StackName", stackName)
+            .formParam("TemplateBody", template)
+        .when().post("/")
+        .then().body(containsString("AlreadyExistsException"));
     }
 
     @Test

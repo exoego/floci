@@ -164,13 +164,21 @@ services:
 
 Function URLs are also reachable directly on `/{proxy:.*}` under the Lambda URL controller, which routes the request into the normal `Invoke` path.
 
-**Stubbed:** `ListLayers` and `ListLayerVersions` return empty arrays. No layer storage exists.
+**Layers:** `PublishLayerVersion`, `GetLayerVersion`, `ListLayerVersions`, `ListLayers`, and
+`DeleteLayerVersion` are implemented, with real local storage under
+`{lambda.codePath}/layers/{name}/{version}`. `CreateFunction`/`UpdateFunctionConfiguration`
+validate each `Layers` ARN eagerly against that storage, matching real AWS - an unresolvable ARN
+is rejected with `InvalidParameterValueException`, not silently accepted. Only resolves layers
+published into this same local Floci instance; a real AWS-owned layer ARN (e.g. the AWS AppConfig
+Extension or a Datadog-published layer) can never resolve here, since there's no mechanism in
+Floci for fetching real AWS content - publish your own copy of the layer's content locally under
+a name you control and reference that ARN instead.
 
 ## Not Implemented
 
 These AWS Lambda operations have no handler in Floci. Calls will return `404` or an error:
 
-- Layers (`PublishLayerVersion`, `DeleteLayerVersion`, `GetLayerVersion`, `GetLayerVersionByArn`, `AddLayerVersionPermission`, `RemoveLayerVersionPermission`, `GetLayerVersionPolicy`)
+- Layer permissions and cross-account ARN lookup (`GetLayerVersionByArn`, `AddLayerVersionPermission`, `RemoveLayerVersionPermission`, `GetLayerVersionPolicy`)
 - Provisioned concurrency (`PutProvisionedConcurrencyConfig`, `GetProvisionedConcurrencyConfig`, `ListProvisionedConcurrencyConfigs`, `DeleteProvisionedConcurrencyConfig`)
 - Dead-letter, async invoke config, and event invoke config operations
 - `InvokeWithResponseStream`
@@ -197,11 +205,25 @@ These AWS Lambda operations have no handler in Floci. Calls will return `404` or
 | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | *(unset)* | Docker network to attach Lambda containers to (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
 | `FLOCI_SERVICES_LAMBDA_EXTRA_HOSTS` | *(unset)* | Comma-separated `hostname:ip` entries added to each Lambda container's `/etc/hosts`; `ip` may be `host-gateway`, mirroring `docker run --add-host` |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | *(unset)* | Explicit host/IP that spawned Lambda containers use to reach Floci's Runtime API, bypassing auto-detection |
+| `FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX` | `floci` | Base name prefix for spawned Lambda containers and code volumes (e.g. `acme` → `acme-<function>-<id>` containers, `acme-code-<function>-<hash>` volumes). Must be a valid Docker name segment (`[A-Za-z0-9][A-Za-z0-9_.-]*`); invalid values are ignored with a warning |
 | `FLOCI_SERVICES_LAMBDA_EXECUTOR` | `docker` | Execution backend: `docker` (containers) or `kubernetes` (pods) |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_NAMESPACE` | `default` | Namespace Lambda pods are created in |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_LABELS` | *(unset)* | Extra pod labels as comma-separated `key=value` entries |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_FLOCI_ADDRESS` | *(unset)* | Host/IP pods use to reach Floci; auto-detected when Floci runs in-cluster |
 | `FLOCI_SERVICES_LAMBDA_KUBERNETES_INIT_IMAGE` | `busybox:1.36` | Init-container image that downloads function code (needs `sh`, `wget`, `unzip`) |
+
+!!! note "Changing the container name prefix"
+    Code volumes are resolved by name, and a Floci process only manages resources under its
+    own prefix — deliberately, so multiple Floci processes with different prefixes can share
+    one Docker daemon without touching each other's containers and volumes. Restarting with a
+    different `container-name-prefix` therefore strands the code volumes (and their completion
+    markers) created under the previous prefix: they are no longer reused and no longer part of
+    automatic superseded-volume cleanup. They keep the prefix-independent `floci=true` label,
+    so reclaim them at any time with:
+
+    ```bash
+    docker volume prune --filter label=floci=true
+    ```
 
 ### Runtime API host override
 

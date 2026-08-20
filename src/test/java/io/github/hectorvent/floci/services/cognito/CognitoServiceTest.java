@@ -1860,6 +1860,70 @@ class CognitoServiceTest {
         assertNotNull(refreshed.get("IdToken"));
     }
 
+    @Test
+    void refreshTokenAuthFlowExpiredTokenThrows() {
+        UserPool pool = createPoolAndUser();
+        UserPoolClient client = service.createUserPoolClient(
+                pool.getId(),
+                "c",
+                false,
+                false,
+                List.of(),
+                List.of(),
+                null,
+                List.of(),
+                null,
+                List.of(),
+                null,
+                null,
+                List.of(),
+                null,
+                List.of(),
+                1,
+                List.of(),
+                Map.of("RefreshToken", "seconds"),
+                List.of(),
+                null,
+                null
+        );
+
+        // issued-at is epoch MILLISECONDS, exactly as buildRefreshToken writes it. A token
+        // issued 10s ago against a 1s refresh lifetime is expired only if isRefreshTokenExpired
+        // converts millis to seconds before comparing — before the fix the InitiateAuth
+        // REFRESH_TOKEN_AUTH path never called the check at all, so this minted fresh tokens.
+        long issuedAtMillis = System.currentTimeMillis() - 10_000L;
+        String raw = pool.getId() + "|alice|" + client.getClientId() + "|" + issuedAtMillis + "|"
+                + java.util.UUID.randomUUID();
+        String expiredRefreshToken = signRawRefreshToken(pool, raw);
+
+        AwsException exception = assertThrows(AwsException.class, () ->
+                service.initiateAuth(client.getClientId(), "REFRESH_TOKEN_AUTH",
+                        Map.of("REFRESH_TOKEN", expiredRefreshToken)));
+        assertEquals("NotAuthorizedException", exception.getErrorCode());
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void refreshTokenAuthFlowRejectsTokenFromAnotherPool() {
+        // Two independent pools, each with an "alice". A refresh token minted for poolB is
+        // validly HMAC-signed (by poolB) and its username resolves in poolA too, so the only
+        // thing that can reject it against poolA's client is the embedded pool-id check.
+        UserPool poolA = createPoolAndUser();
+        UserPool poolB = createPoolAndUser();
+        UserPoolClient clientA = service.createUserPoolClient(poolA.getId(), "ca", false, false, List.of(), List.of());
+        UserPoolClient clientB = service.createUserPoolClient(poolB.getId(), "cb", false, false, List.of(), List.of());
+
+        Map<String, Object> authB = (Map<String, Object>) service.initiateAuth(
+                clientB.getClientId(), "USER_PASSWORD_AUTH",
+                Map.of("USERNAME", "alice", "PASSWORD", "Perm1234!")).get("AuthenticationResult");
+        String foreignRefreshToken = (String) authB.get("RefreshToken");
+
+        AwsException exception = assertThrows(AwsException.class, () ->
+                service.initiateAuth(clientA.getClientId(), "REFRESH_TOKEN_AUTH",
+                        Map.of("REFRESH_TOKEN", foreignRefreshToken)));
+        assertEquals("NotAuthorizedException", exception.getErrorCode());
+    }
+
     // =========================================================================
     // Issue #2137 — Refresh tokens must be unforgeable (HMAC-signed)
     // =========================================================================

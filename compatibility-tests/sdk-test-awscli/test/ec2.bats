@@ -9,14 +9,28 @@ setup() {
     SG_SOURCE_ID=""
     SG_TARGET_ID=""
     TRANSIT_GATEWAY_ID=""
+    TGW_ATTACHMENT_ID=""
+    TGW_VPC_ID=""
+    TGW_ROUTE_TABLE_ID=""
 }
 
 teardown() {
     if [ -n "$PREFIX_LIST_ID" ]; then
         aws_cmd ec2 delete-managed-prefix-list --prefix-list-id "$PREFIX_LIST_ID" >/dev/null 2>&1 || true
     fi
+    if [ -n "$TGW_ROUTE_TABLE_ID" ]; then
+        aws_cmd ec2 delete-transit-gateway-route-table \
+            --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$TGW_ATTACHMENT_ID" ]; then
+        aws_cmd ec2 delete-transit-gateway-vpc-attachment \
+            --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID" >/dev/null 2>&1 || true
+    fi
     if [ -n "$TRANSIT_GATEWAY_ID" ]; then
         aws_cmd ec2 delete-transit-gateway --transit-gateway-id "$TRANSIT_GATEWAY_ID" >/dev/null 2>&1 || true
+    fi
+    if [ -n "$TGW_VPC_ID" ]; then
+        aws_cmd ec2 delete-vpc --vpc-id "$TGW_VPC_ID" >/dev/null 2>&1 || true
     fi
     for sg in "$SG_TARGET_ID" "$SG_SOURCE_ID"; do
         if [ -n "$sg" ]; then
@@ -338,4 +352,257 @@ create_sg_pair() {
     run aws_cmd ec2 describe-transit-gateways --transit-gateway-ids tgw-0123456789abcdef0
     assert_failure
     assert_output --partial "InvalidTransitGatewayID.NotFound"
+}
+
+# ─── transit gateway VPC attachments ────────────────────────────────────────
+
+# Creates a gateway, a VPC and one subnet, setting TRANSIT_GATEWAY_ID, TGW_VPC_ID and TGW_SUBNET_ID.
+create_attachment_fixture() {
+    local out
+    out=$(aws_cmd ec2 create-transit-gateway --description "bats attachment host")
+    TRANSIT_GATEWAY_ID=$(json_get "$out" '.TransitGateway.TransitGatewayId')
+    out=$(aws_cmd ec2 create-vpc --cidr-block 10.80.0.0/16)
+    TGW_VPC_ID=$(json_get "$out" '.Vpc.VpcId')
+    out=$(aws_cmd ec2 create-subnet --vpc-id "$TGW_VPC_ID" --cidr-block 10.80.1.0/24 \
+        --availability-zone "${AWS_DEFAULT_REGION}a")
+    TGW_SUBNET_ID=$(json_get "$out" '.Subnet.SubnetId')
+}
+
+@test "EC2: attach a VPC to a transit gateway and read it back both ways" {
+    create_attachment_fixture
+
+    run aws_cmd ec2 create-transit-gateway-vpc-attachment \
+        --transit-gateway-id "$TRANSIT_GATEWAY_ID" \
+        --vpc-id "$TGW_VPC_ID" \
+        --subnet-ids "$TGW_SUBNET_ID" \
+        --tag-specifications 'ResourceType=transit-gateway-attachment,Tags=[{Key=Name,Value=bats-attach}]'
+    assert_success
+    TGW_ATTACHMENT_ID=$(json_get "$output" '.TransitGatewayVpcAttachment.TransitGatewayAttachmentId')
+    [ "$(json_get "$output" '.TransitGatewayVpcAttachment.State')" = "available" ]
+    [ "$(json_get "$output" '.TransitGatewayVpcAttachment.SubnetIds[0]')" = "$TGW_SUBNET_ID" ]
+    # The attachment's own default, which differs from the gateway's.
+    [ "$(json_get "$output" '.TransitGatewayVpcAttachment.Options.SecurityGroupReferencingSupport')" = "enable" ]
+
+    run aws_cmd ec2 describe-transit-gateway-vpc-attachments \
+        --transit-gateway-attachment-ids "$TGW_ATTACHMENT_ID"
+    assert_success
+    [ "$(json_get "$output" '.TransitGatewayVpcAttachments[0].VpcId')" = "$TGW_VPC_ID" ]
+    [ "$(json_get "$output" '.TransitGatewayVpcAttachments[0].Tags[0].Value')" = "bats-attach" ]
+
+    # The resource-agnostic form is a different shape: typed resource plus the association.
+    run aws_cmd ec2 describe-transit-gateway-attachments \
+        --transit-gateway-attachment-ids "$TGW_ATTACHMENT_ID"
+    assert_success
+    [ "$(json_get "$output" '.TransitGatewayAttachments[0].ResourceType')" = "vpc" ]
+    [ "$(json_get "$output" '.TransitGatewayAttachments[0].ResourceId')" = "$TGW_VPC_ID" ]
+    [ "$(json_get "$output" '.TransitGatewayAttachments[0].Association.State')" = "associated" ]
+    rtb=$(json_get "$output" '.TransitGatewayAttachments[0].Association.TransitGatewayRouteTableId')
+    case "$rtb" in tgw-rtb-*) ;; *) return 1 ;; esac
+}
+
+@test "EC2: modify a transit gateway VPC attachment" {
+    create_attachment_fixture
+    local out subnet_b
+    out=$(aws_cmd ec2 create-transit-gateway-vpc-attachment --transit-gateway-id "$TRANSIT_GATEWAY_ID" \
+        --vpc-id "$TGW_VPC_ID" --subnet-ids "$TGW_SUBNET_ID")
+    TGW_ATTACHMENT_ID=$(json_get "$out" '.TransitGatewayVpcAttachment.TransitGatewayAttachmentId')
+    out=$(aws_cmd ec2 create-subnet --vpc-id "$TGW_VPC_ID" --cidr-block 10.80.2.0/24 \
+        --availability-zone "${AWS_DEFAULT_REGION}b")
+    subnet_b=$(json_get "$out" '.Subnet.SubnetId')
+
+    run aws_cmd ec2 modify-transit-gateway-vpc-attachment \
+        --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID" \
+        --add-subnet-ids "$subnet_b" \
+        --options 'DnsSupport=disable'
+    assert_success
+    [ "$(json_get "$output" '.TransitGatewayVpcAttachment.Options.DnsSupport')" = "disable" ]
+    count=$(json_get "$output" '.TransitGatewayVpcAttachment.SubnetIds | length')
+    [ "$count" = "2" ]
+
+    run aws_cmd ec2 modify-transit-gateway-vpc-attachment \
+        --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID" \
+        --remove-subnet-ids "$TGW_SUBNET_ID" "$subnet_b"
+    assert_failure
+    assert_output --partial "InsufficientSubnetsException"
+}
+
+@test "EC2: a transit gateway with an attachment cannot be deleted" {
+    create_attachment_fixture
+    local out
+    out=$(aws_cmd ec2 create-transit-gateway-vpc-attachment --transit-gateway-id "$TRANSIT_GATEWAY_ID" \
+        --vpc-id "$TGW_VPC_ID" --subnet-ids "$TGW_SUBNET_ID")
+    TGW_ATTACHMENT_ID=$(json_get "$out" '.TransitGatewayVpcAttachment.TransitGatewayAttachmentId')
+
+    run aws_cmd ec2 delete-transit-gateway --transit-gateway-id "$TRANSIT_GATEWAY_ID"
+    assert_failure
+    assert_output --partial "IncorrectState"
+
+    run aws_cmd ec2 delete-transit-gateway-vpc-attachment \
+        --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID"
+    assert_success
+    TGW_ATTACHMENT_ID=""
+
+    run aws_cmd ec2 delete-transit-gateway --transit-gateway-id "$TRANSIT_GATEWAY_ID"
+    assert_success
+    TRANSIT_GATEWAY_ID=""
+}
+
+# ─── transit gateway route tables, associations, propagations and routes ────
+
+@test "EC2: route table associations move between tables" {
+    create_attachment_fixture
+    local out
+    out=$(aws_cmd ec2 create-transit-gateway-vpc-attachment --transit-gateway-id "$TRANSIT_GATEWAY_ID" \
+        --vpc-id "$TGW_VPC_ID" --subnet-ids "$TGW_SUBNET_ID")
+    TGW_ATTACHMENT_ID=$(json_get "$out" '.TransitGatewayVpcAttachment.TransitGatewayAttachmentId')
+    out=$(aws_cmd ec2 describe-transit-gateways --transit-gateway-ids "$TRANSIT_GATEWAY_ID")
+    local default_rtb
+    default_rtb=$(json_get "$out" '.TransitGateways[0].Options.AssociationDefaultRouteTableId')
+
+    run aws_cmd ec2 create-transit-gateway-route-table --transit-gateway-id "$TRANSIT_GATEWAY_ID" \
+        --tag-specifications 'ResourceType=transit-gateway-route-table,Tags=[{Key=Name,Value=bats-rtb}]'
+    assert_success
+    TGW_ROUTE_TABLE_ID=$(json_get "$output" '.TransitGatewayRouteTable.TransitGatewayRouteTableId')
+    [ "$(json_get "$output" '.TransitGatewayRouteTable.State')" = "available" ]
+    [ "$(json_get "$output" '.TransitGatewayRouteTable.DefaultAssociationRouteTable')" = "false" ]
+
+    # The attachment starts on the gateway's default table, so a second association is refused.
+    run aws_cmd ec2 associate-transit-gateway-route-table \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID"
+    assert_failure
+    assert_output --partial "Resource.AlreadyAssociated"
+
+    run aws_cmd ec2 disassociate-transit-gateway-route-table \
+        --transit-gateway-route-table-id "$default_rtb" \
+        --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID"
+    assert_success
+    [ "$(json_get "$output" '.Association.State')" = "disassociating" ]
+
+    run aws_cmd ec2 associate-transit-gateway-route-table \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID"
+    assert_success
+    [ "$(json_get "$output" '.Association.State')" = "associating" ]
+
+    run aws_cmd ec2 get-transit-gateway-route-table-associations \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID"
+    assert_success
+    [ "$(json_get "$output" '.Associations[0].TransitGatewayAttachmentId')" = "$TGW_ATTACHMENT_ID" ]
+    [ "$(json_get "$output" '.Associations[0].ResourceType')" = "vpc" ]
+}
+
+@test "EC2: propagation produces a route for the attached VPC" {
+    create_attachment_fixture
+    local out
+    out=$(aws_cmd ec2 create-transit-gateway-vpc-attachment --transit-gateway-id "$TRANSIT_GATEWAY_ID" \
+        --vpc-id "$TGW_VPC_ID" --subnet-ids "$TGW_SUBNET_ID")
+    TGW_ATTACHMENT_ID=$(json_get "$out" '.TransitGatewayVpcAttachment.TransitGatewayAttachmentId')
+    out=$(aws_cmd ec2 create-transit-gateway-route-table --transit-gateway-id "$TRANSIT_GATEWAY_ID")
+    TGW_ROUTE_TABLE_ID=$(json_get "$out" '.TransitGatewayRouteTable.TransitGatewayRouteTableId')
+
+    run aws_cmd ec2 enable-transit-gateway-route-table-propagation \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID"
+    assert_success
+    [ "$(json_get "$output" '.Propagation.State')" = "enabled" ]
+
+    run aws_cmd ec2 get-transit-gateway-route-table-propagations \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID"
+    assert_success
+    [ "$(json_get "$output" '.TransitGatewayRouteTablePropagations[0].State')" = "enabled" ]
+
+    run aws_cmd ec2 search-transit-gateway-routes \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --filters 'Name=type,Values=propagated'
+    assert_success
+    [ "$(json_get "$output" '.Routes[0].DestinationCidrBlock')" = "10.80.0.0/16" ]
+    [ "$(json_get "$output" '.Routes[0].Type')" = "propagated" ]
+    [ "$(json_get "$output" '.Routes[0].State')" = "active" ]
+
+    run aws_cmd ec2 enable-transit-gateway-route-table-propagation \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID"
+    assert_failure
+    assert_output --partial "TransitGatewayRouteTablePropagation.Duplicate"
+}
+
+@test "EC2: static and blackhole transit gateway routes" {
+    create_attachment_fixture
+    local out
+    out=$(aws_cmd ec2 create-transit-gateway-vpc-attachment --transit-gateway-id "$TRANSIT_GATEWAY_ID" \
+        --vpc-id "$TGW_VPC_ID" --subnet-ids "$TGW_SUBNET_ID")
+    TGW_ATTACHMENT_ID=$(json_get "$out" '.TransitGatewayVpcAttachment.TransitGatewayAttachmentId')
+    out=$(aws_cmd ec2 create-transit-gateway-route-table --transit-gateway-id "$TRANSIT_GATEWAY_ID")
+    TGW_ROUTE_TABLE_ID=$(json_get "$out" '.TransitGatewayRouteTable.TransitGatewayRouteTableId')
+
+    run aws_cmd ec2 create-transit-gateway-route \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --destination-cidr-block 10.60.0.0/16 \
+        --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID"
+    assert_success
+    [ "$(json_get "$output" '.Route.Type')" = "static" ]
+    [ "$(json_get "$output" '.Route.State')" = "active" ]
+    [ "$(json_get "$output" '.Route.TransitGatewayAttachments[0].TransitGatewayAttachmentId')" = "$TGW_ATTACHMENT_ID" ]
+
+    run aws_cmd ec2 create-transit-gateway-route \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --destination-cidr-block 10.61.0.0/16 --blackhole
+    assert_success
+    [ "$(json_get "$output" '.Route.State')" = "blackhole" ]
+    # A blackhole carries no attachment, so the key is absent rather than empty.
+    count=$(json_get "$output" '.Route.TransitGatewayAttachments // [] | length')
+    [ "$count" = "0" ]
+
+    run aws_cmd ec2 search-transit-gateway-routes \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --filters 'Name=type,Values=static'
+    assert_success
+    count=$(json_get "$output" '.Routes | length')
+    [ "$count" = "2" ]
+
+    run aws_cmd ec2 delete-transit-gateway-route \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --destination-cidr-block 10.61.0.0/16
+    assert_success
+    [ "$(json_get "$output" '.Route.State')" = "deleted" ]
+}
+
+@test "EC2: replacing a transit gateway route moves its target and upserts" {
+    create_attachment_fixture
+    local out
+    out=$(aws_cmd ec2 create-transit-gateway-vpc-attachment --transit-gateway-id "$TRANSIT_GATEWAY_ID" \
+        --vpc-id "$TGW_VPC_ID" --subnet-ids "$TGW_SUBNET_ID")
+    TGW_ATTACHMENT_ID=$(json_get "$out" '.TransitGatewayVpcAttachment.TransitGatewayAttachmentId')
+    out=$(aws_cmd ec2 create-transit-gateway-route-table --transit-gateway-id "$TRANSIT_GATEWAY_ID")
+    TGW_ROUTE_TABLE_ID=$(json_get "$out" '.TransitGatewayRouteTable.TransitGatewayRouteTableId')
+    aws_cmd ec2 create-transit-gateway-route --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --destination-cidr-block 10.88.0.0/16 --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID" >/dev/null
+
+    run aws_cmd ec2 replace-transit-gateway-route \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --destination-cidr-block 10.88.0.0/16 --blackhole
+    assert_success
+    [ "$(json_get "$output" '.Route.State')" = "blackhole" ]
+    count=$(json_get "$output" '.Route.TransitGatewayAttachments // [] | length')
+    [ "$count" = "0" ]
+
+    run aws_cmd ec2 replace-transit-gateway-route \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --destination-cidr-block 10.88.0.0/16 \
+        --transit-gateway-attachment-id "$TGW_ATTACHMENT_ID"
+    assert_success
+    [ "$(json_get "$output" '.Route.State')" = "active" ]
+
+    # Replacing a destination the table never held writes it.
+    run aws_cmd ec2 replace-transit-gateway-route \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --destination-cidr-block 10.89.0.0/16 --blackhole
+    assert_success
+    run aws_cmd ec2 search-transit-gateway-routes \
+        --transit-gateway-route-table-id "$TGW_ROUTE_TABLE_ID" \
+        --filters 'Name=type,Values=static'
+    assert_success
+    count=$(json_get "$output" '.Routes | length')
+    [ "$count" = "2" ]
 }

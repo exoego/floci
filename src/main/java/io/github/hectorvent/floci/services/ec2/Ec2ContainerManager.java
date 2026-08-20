@@ -19,6 +19,7 @@ import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
+import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
@@ -96,6 +97,11 @@ public class Ec2ContainerManager {
         this.config = config;
         this.metadataServer = metadataServer;
         this.portForwardManager = portForwardManager;
+    }
+
+    @PreDestroy
+    void stop() {
+        executor.shutdownNow();
     }
 
     /**

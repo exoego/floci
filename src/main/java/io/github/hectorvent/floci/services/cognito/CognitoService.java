@@ -2399,14 +2399,17 @@ public class CognitoService {
         return configured == null || configured.isBlank() ? defaultUnit : configured.trim().toLowerCase(Locale.ROOT);
     }
 
-    private boolean isRefreshTokenExpired(UserPoolClient client, String[] parts) {
+    boolean isRefreshTokenExpired(UserPoolClient client, String[] parts) {
         if (parts.length < 5) {
             return false;
         }
         try {
-            long issuedAt = Long.parseLong(parts[3]);
-            long expiresAt = issuedAt + resolveTokenLifetimeSeconds(client, "refresh");
-            return System.currentTimeMillis() / 1000L >= expiresAt;
+            // buildRefreshToken writes issued-at as epoch milliseconds, but the lifetime and
+            // the comparison clock below are in seconds — convert before comparing so the check
+            // is not off by a factor of ~1000 (which made it never fire for real tokens).
+            long issuedAtSeconds = Long.parseLong(parts[3]) / 1000L;
+            long expiresAtSeconds = issuedAtSeconds + resolveTokenLifetimeSeconds(client, "refresh");
+            return System.currentTimeMillis() / 1000L >= expiresAtSeconds;
         } catch (NumberFormatException ignored) {
             return false;
         }

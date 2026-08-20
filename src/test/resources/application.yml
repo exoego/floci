@@ -9,6 +9,11 @@ quarkus:
   kubernetes-client:
     devservices:
       enabled: false
+  # Groovy (a REST Assured dependency) starts DFA-cache-cleaner threads that never stop.
+  # Loaded parent-first they live in the shared system classloader, so they cannot pin a
+  # per-profile application classloader across the many app restarts of a test run.
+  class-loading:
+    parent-first-artifacts: org.apache.groovy:groovy
 
 floci:
   base-url: "http://localhost:4566"
