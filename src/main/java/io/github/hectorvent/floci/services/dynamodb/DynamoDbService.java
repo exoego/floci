@@ -412,6 +412,7 @@ public class DynamoDbService {
         final JsonNode normalizedItem = DynamoDbNumberUtils.normalizeNumbersInItem(item);
         DynamoDbItemSize.validateSize(normalizedItem);
         String itemKey = buildItemKey(table, normalizedItem);
+        validateKeySchemaTypes(table, normalizedItem);
 
         withItemLock(storageKey, itemKey, () -> {
             var tableItems = itemsByTable.computeIfAbsent(scopedItemsKey(storageKey), k -> new ConcurrentSkipListMap<>());
@@ -632,6 +633,8 @@ public class DynamoDbService {
                             + ". This attribute is part of the key", 400);
                 }
             }
+
+            validateKeySchemaTypes(table, item);
 
             items.put(itemKey, item);
             persistItems(storageKey);
@@ -1069,6 +1072,13 @@ public class DynamoDbService {
             for (ReentrantLock lock : toAcquire.values()) {
                 lock.lock();
                 acquired.add(lock);
+            }
+
+            // Validate key attribute values before applying anything so a failure cancels
+            // the whole transaction. AWS reports this as a TransactionCanceledException with
+            // a ValidationError reason; floci raises the same message as a ValidationException.
+            for (var transactItem : transactItems) {
+                validateTransactWriteKeys(transactItem, region);
             }
 
             // First pass: evaluate all conditions and collect failures.
@@ -2487,6 +2497,121 @@ public class DynamoDbService {
                     "One or more parameter values were invalid: "
                     + "The AttributeValue for a key attribute cannot contain an empty string value. Key: " + keyName, 400);
         }
+    }
+
+    /**
+     * Rejects writes whose base table or index key attribute value mismatches its
+     * AttributeDefinitions type (NULL included) or is an empty string, mirroring real
+     * DynamoDB messages. Keeps un-indexable items out of index Scans (floci-io/floci#2275).
+     */
+    private void validateKeySchemaTypes(TableDefinition table, JsonNode item) {
+        validateBaseKeyType(table, item, table.getPartitionKeyName());
+        for (var skName : table.getSortKeyNames()) {
+            validateBaseKeyType(table, item, skName);
+        }
+        if (table.getGlobalSecondaryIndexes() != null) {
+            for (var gsi : table.getGlobalSecondaryIndexes()) {
+                validateIndexKeyType(table, item, gsi.getIndexName(), gsi.getPartitionKeyName());
+                for (var skName : gsi.getSortKeyNames()) {
+                    validateIndexKeyType(table, item, gsi.getIndexName(), skName);
+                }
+            }
+        }
+        if (table.getLocalSecondaryIndexes() != null) {
+            for (var lsi : table.getLocalSecondaryIndexes()) {
+                validateIndexKeyType(table, item, lsi.getIndexName(), lsi.getPartitionKeyName());
+                for (var skName : lsi.getSortKeyNames()) {
+                    validateIndexKeyType(table, item, lsi.getIndexName(), skName);
+                }
+            }
+        }
+    }
+
+    private void validateBaseKeyType(TableDefinition table, JsonNode item, String keyName) {
+        var actual = attributeValueType(item.get(keyName));
+        if (actual == null) {
+            return;
+        }
+        var expected = definedAttributeType(table, keyName);
+        if (expected != null && !expected.equals(actual)) {
+            throw new AwsException("ValidationException",
+                    "One or more parameter values were invalid: Type mismatch for key " + keyName
+                    + " expected: " + expected + " actual: " + actual, 400);
+        }
+    }
+
+    private void validateIndexKeyType(TableDefinition table, JsonNode item, String indexName, String keyName) {
+        var attr = item.get(keyName);
+        var actual = attributeValueType(attr);
+        if (actual == null) {
+            return;
+        }
+        var expected = definedAttributeType(table, keyName);
+        if (expected != null && !expected.equals(actual)) {
+            throw new AwsException("ValidationException",
+                    "One or more parameter values were invalid: Type mismatch for Index Key " + keyName
+                    + " Expected: " + expected + " Actual: " + actual + " IndexName: " + indexName, 400);
+        }
+        if ("S".equals(actual) && attr.get("S").asText().isEmpty()) {
+            throw new AwsException("ValidationException",
+                    "One or more parameter values are not valid. "
+                    + "A value specified for a secondary index key is not supported. "
+                    + "The AttributeValue for a key attribute cannot contain an empty string value. "
+                    + "IndexName: " + indexName + ", IndexKey: " + keyName, 400);
+        }
+    }
+
+    private static String attributeValueType(JsonNode attr) {
+        if (attr == null || !attr.isObject() || attr.isEmpty()) {
+            return null;
+        }
+        return attr.fieldNames().next();
+    }
+
+    private String definedAttributeType(TableDefinition table, String attrName) {
+        if (table.getAttributeDefinitions() == null) {
+            return null;
+        }
+        return table.getAttributeDefinitions().stream()
+                .filter(d -> attrName.equals(d.getAttributeName()))
+                .map(AttributeDefinition::getAttributeType)
+                .findFirst()
+                .orElse(null);
+    }
+
+    private void validateTransactWriteKeys(JsonNode transactItem, String region) {
+        var put = transactItem.get("Put");
+        if (put != null) {
+            var table = transactTable(put, region);
+            var item = put.get("Item");
+            if (table != null && item != null) {
+                validateKeySchemaTypes(table, item);
+            }
+            return;
+        }
+        var upd = transactItem.get("Update");
+        if (upd != null) {
+            var table = transactTable(upd, region);
+            var key = upd.get("Key");
+            if (table == null || key == null || !key.isObject()) {
+                return;
+            }
+            var canonicalTableName = canonicalTableName(region, upd.path("TableName").asText());
+            var tableItems = itemsByTable.get(scopedItemsKey(regionKey(region, canonicalTableName)));
+            var existing = tableItems != null ? tableItems.get(buildItemKey(table, key)) : null;
+            var merged = (ObjectNode) (existing != null ? existing : key).deepCopy();
+            if (upd.has("UpdateExpression")) {
+                applyUpdateExpression(merged, upd.get("UpdateExpression").asText(),
+                        upd.has("ExpressionAttributeNames") ? upd.get("ExpressionAttributeNames") : null,
+                        upd.has("ExpressionAttributeValues") ? upd.get("ExpressionAttributeValues") : null);
+            }
+            validateKeySchemaTypes(table, merged);
+        }
+    }
+
+    private TableDefinition transactTable(JsonNode target, String region) {
+        var canonicalTableName = canonicalTableName(region, target.path("TableName").asText());
+        return tableStore.get(regionKey(region, canonicalTableName)).orElse(null);
     }
 
     private String buildItemKeyFromNode(JsonNode item, String pkName, String skName) {
