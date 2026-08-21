@@ -127,7 +127,7 @@ aws dynamodb create-table \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
 
-Secondary indexes are sparse. An item that is missing any index key attribute is not in the index. Query and Scan with `IndexName` never return such items. Writes are validated like on AWS. A write is rejected with a `ValidationException` when a key attribute of the base table or an index does not match its `AttributeDefinitions` type. `NULL` and empty string key values are rejected the same way.
+Secondary indexes are sparse. An item that is missing any index key attribute is not in the index. Query and Scan with `IndexName` never return such items. Writes are validated like on AWS. A write is rejected with a `ValidationException` when a key attribute of the base table or an index does not match its `AttributeDefinitions` type. `NULL` and empty string key values are rejected the same way. An existing item whose attribute type conflicts with an index added later stays out of that index, matching the AWS backfill behavior.
 
 ## Export to S3
 

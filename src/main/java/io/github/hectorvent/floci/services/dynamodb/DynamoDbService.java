@@ -721,14 +721,15 @@ public class DynamoDbService {
                                           expressionAttrValues, exprAttrNames);
         }
 
-        // Filter out items without GSI key attributes (sparse index behavior).
-        // DynamoDB excludes items from a GSI if any key attribute is null/missing.
+        // Sparse index behavior: an item is in the index only if every key attribute is
+        // present, non-NULL, and of the defined type. A type-mismatched attribute can
+        // predate the index (UpdateTable backfill skips such items on AWS).
         if (indexName != null) {
             String finalPkName = pkName;
             String finalSkName = skName;
             results = results.stream()
-                    .filter(item -> item.has(finalPkName) && hasNonNullAttribute(item, finalPkName))
-                    .filter(item -> finalSkName == null || (item.has(finalSkName) && hasNonNullAttribute(item, finalSkName)))
+                    .filter(item -> isIndexKeyValue(table, item, finalPkName))
+                    .filter(item -> finalSkName == null || isIndexKeyValue(table, item, finalSkName))
                     .toList();
         }
 
@@ -886,11 +887,11 @@ public class DynamoDbService {
         JsonNode lastScanned = null;
         for (JsonNode item : source) {
             // Sparse index behavior: a scan of a secondary index reads the index
-            // itself, and base-table items missing any index key attribute do not
-            // exist in the index — they are never read, never counted, and can
-            // never anchor a cursor.
-            if (indexScan && !(hasNonNullAttribute(item, lekPkName)
-                    && (lekSkName == null || hasNonNullAttribute(item, lekSkName)))) {
+            // itself. Base-table items whose key attribute is missing, NULL, or of
+            // the wrong type do not exist in the index — they are never read, never
+            // counted, and can never anchor a cursor.
+            if (indexScan && !(isIndexKeyValue(table, item, lekPkName)
+                    && (lekSkName == null || isIndexKeyValue(table, item, lekSkName)))) {
                 continue;
             }
             // Stop at whichever boundary the read reaches first: the 1 MB cap or
@@ -2362,15 +2363,6 @@ public class DynamoDbService {
         return ExpressionEvaluator.attributeValuesEqual(a, b);
     }
 
-    /**
-     * Returns true if the item has the given attribute with a non-null DynamoDB value.
-     * An attribute is considered null if it is the DynamoDB NULL type ({@code {"NULL": true}}).
-     */
-    private static boolean hasNonNullAttribute(JsonNode item, String attrName) {
-        JsonNode attr = item.get(attrName);
-        if (attr == null) return false;
-        return !attr.has("NULL");
-    }
 
     private int compareValues(String a, String b) {
         try {
@@ -2559,6 +2551,19 @@ public class DynamoDbService {
                     + "The AttributeValue for a key attribute cannot contain an empty string value. "
                     + "IndexName: " + indexName + ", IndexKey: " + keyName, 400);
         }
+    }
+
+    /**
+     * True if the item can appear in an index keyed on this attribute. The value must be
+     * present, non-NULL, and match the AttributeDefinitions type when one is defined.
+     */
+    private boolean isIndexKeyValue(TableDefinition table, JsonNode item, String attrName) {
+        var attr = item.get(attrName);
+        if (attr == null || attr.has("NULL")) {
+            return false;
+        }
+        var expected = definedAttributeType(table, attrName);
+        return expected == null || expected.equals(attributeValueType(attr));
     }
 
     private static String attributeValueType(JsonNode attr) {

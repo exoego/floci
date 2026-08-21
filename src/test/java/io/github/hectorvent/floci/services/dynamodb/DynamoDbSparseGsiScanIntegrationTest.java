@@ -355,6 +355,96 @@ class DynamoDbSparseGsiScanIntegrationTest {
         assertEquals("record-with-gsi-keys", result.path("Items").get(0).path("id").path("S").asText());
     }
 
+    // A GSI added by UpdateTable is backfilled over existing items. On AWS an existing
+    // item whose key attribute type conflicts with the new index is left out of the
+    // index, while later writes with that type are rejected. Verified on real DynamoDB.
+
+    private static final String BACKFILL_TABLE = "SparseGsiBackfill";
+
+    @Test
+    @Order(13)
+    void gsiAddedOverExistingItemsExcludesTypeMismatchedItems() throws Exception {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+                    "BillingMode": "PAY_PER_REQUEST"
+                }
+                """.formatted(BACKFILL_TABLE))
+        .when().post("/")
+        .then().statusCode(200);
+
+        var items = new String[] {
+            "{\"id\": {\"S\": \"s-item\"}, \"x\": {\"S\": \"a\"}}",
+            "{\"id\": {\"S\": \"n-item\"}, \"x\": {\"N\": \"5\"}}",
+            "{\"id\": {\"S\": \"no-x\"}}"
+        };
+        for (var item : items) {
+            given()
+                .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
+                .contentType(DYNAMODB_CONTENT_TYPE)
+                .body("{\"TableName\": \"%s\", \"Item\": %s}".formatted(BACKFILL_TABLE, item))
+            .when().post("/")
+            .then().statusCode(200);
+        }
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "AttributeDefinitions": [
+                        {"AttributeName": "id", "AttributeType": "S"},
+                        {"AttributeName": "x", "AttributeType": "S"}
+                    ],
+                    "GlobalSecondaryIndexUpdates": [
+                        {"Create": {
+                            "IndexName": "x-index",
+                            "KeySchema": [{"AttributeName": "x", "KeyType": "HASH"}],
+                            "Projection": {"ProjectionType": "ALL"}
+                        }}
+                    ]
+                }
+                """.formatted(BACKFILL_TABLE))
+        .when().post("/")
+        .then().statusCode(200);
+
+        var result = scan("""
+            {
+                "TableName": "%s",
+                "IndexName": "x-index"
+            }
+            """.formatted(BACKFILL_TABLE));
+        assertEquals(1, result.path("Count").asInt(),
+                "an item whose key attribute type conflicts with the index is not in it: " + result);
+        assertEquals(1, result.path("ScannedCount").asInt());
+        assertEquals("s-item", result.path("Items").get(0).path("id").path("S").asText());
+    }
+
+    @Test
+    @Order(14)
+    void writesAfterGsiCreationAreValidatedAgainstItsKeyTypes() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "%s",
+                    "Item": {"id": {"S": "post-gsi-n"}, "x": {"N": "9"}}
+                }
+                """.formatted(BACKFILL_TABLE))
+        .when().post("/")
+        .then().statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("One or more parameter values were invalid: "
+                    + "Type mismatch for Index Key x Expected: S Actual: N IndexName: x-index"));
+    }
+
     private JsonNode scan(String body) throws Exception {
         var response = given()
             .header("X-Amz-Target", "DynamoDB_20120810.Scan")
