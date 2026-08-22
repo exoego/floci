@@ -354,6 +354,31 @@ class AslExecutorRetryTest {
     }
 
     @Test
+    void branchErrorStillFailsTheExecution() {
+        when(lambdaExecutor.invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenThrow(new AssertionError("boom"));
+
+        var execution = run("""
+                {
+                  "StartAt": "Par",
+                  "States": {
+                    "Par": {
+                      "Type": "Parallel",
+                      "Branches": [{
+                        "StartAt": "Inner",
+                        "States": {"Inner": {"Type": "Task", "Resource": "%s", "End": true}}
+                      }],
+                      "End": true
+                    }
+                  }
+                }
+                """.formatted(FLAKY_FUNCTION_ARN));
+
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("States.Runtime", execution.getError());
+    }
+
+    @Test
     void retryDelayFollowsBackoffAndCaps() throws Exception {
         assertEquals(10.0, delay("{\"IntervalSeconds\": 10, \"BackoffRate\": 2.0}", 1, 0.5));
         assertEquals(20.0, delay("{\"IntervalSeconds\": 10, \"BackoffRate\": 2.0}", 2, 0.5));
