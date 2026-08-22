@@ -502,8 +502,13 @@ public class StepFunctionsService implements Resettable {
 
     public Execution startSyncExecution(String stateMachineArn, String name, String input, String region) {
         var selection = splitTestCaseSuffix(stateMachineArn);
+        if (selection.testCaseName() != null) {
+            // Matches Step Functions Local, which rejects a test case suffix here.
+            throw new AwsException("UnsupportedOperation",
+                    "Service integration mocking is not supported for the StartSyncExecution operation.",
+                    400);
+        }
         var sm = describeStateMachine(selection.stateMachineArn());
-        var mockedTestCase = resolveMockedTestCase(sm, selection);
         if (!"EXPRESS".equals(sm.getType())) {
             throw new AwsException("StateMachineTypeNotSupported",
                     "StartSyncExecution is only supported for EXPRESS state machines", 400);
@@ -533,7 +538,7 @@ public class StepFunctionsService implements Resettable {
                                      "roleArn", sm.getRoleArn() != null ? sm.getRoleArn() : ""));
         history.add(startEvent);
 
-        aslExecutor.executeSync(sm, exec, history, mockedTestCase, (updatedExec, updatedHistory) -> {
+        aslExecutor.executeSync(sm, exec, history, (updatedExec, updatedHistory) -> {
             LOG.infov("Sync execution {0} completed with status {1}", updatedExec.getExecutionArn(), updatedExec.getStatus());
         });
 
@@ -546,7 +551,8 @@ public class StepFunctionsService implements Resettable {
     /**
      * Splits the Step Functions Local mocked service integration suffix off a
      * {@code StartExecution} ARN: {@code <stateMachineArn>#<testCaseName>} selects the named
-     * test case from the configured mock configuration file.
+     * test case from the configured mock configuration file. A bare trailing {@code #} selects
+     * no test case and the execution runs unmocked, matching Step Functions Local.
      */
     private static TestCaseSelection splitTestCaseSuffix(String stateMachineArn) {
         var separator = stateMachineArn != null ? stateMachineArn.indexOf('#') : -1;
@@ -554,11 +560,8 @@ public class StepFunctionsService implements Resettable {
             return new TestCaseSelection(stateMachineArn, null);
         }
         var testCaseName = stateMachineArn.substring(separator + 1);
-        if (testCaseName.isBlank()) {
-            throw new AwsException("ValidationException",
-                    "Test case name is missing after '#' in state machine ARN: " + stateMachineArn, 400);
-        }
-        return new TestCaseSelection(stateMachineArn.substring(0, separator), testCaseName);
+        return new TestCaseSelection(stateMachineArn.substring(0, separator),
+                testCaseName.isBlank() ? null : testCaseName);
     }
 
     private MockedTestCase resolveMockedTestCase(StateMachine sm, TestCaseSelection selection) {

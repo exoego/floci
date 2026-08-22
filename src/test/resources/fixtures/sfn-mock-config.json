@@ -11,11 +11,6 @@
       "TestCases": {
         "MockedApiRealDdb": { "Call API": "Ok200" }
       }
-    },
-    "sfn-mock-express-test": {
-      "TestCases": {
-        "HappyPath": { "Call API": "Ok200" }
-      }
     }
   },
   "MockedResponses": {

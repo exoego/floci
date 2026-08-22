@@ -191,7 +191,9 @@ class StepFunctionsMockedServiceIntegrationTest {
 
     @Test
     @Order(5)
-    void syncExecutionSupportsMockTestCases() throws Exception {
+    void syncExecutionRejectsMockTestCases() {
+        // Verified against Step Functions Local 2.0.0, which rejects the suffix here with
+        // UnsupportedOperation.
         var resp = given()
                 .header("X-Amz-Target", "AWSStepFunctions.StartSyncExecution")
                 .contentType(SFN_CONTENT_TYPE)
@@ -199,10 +201,8 @@ class StepFunctionsMockedServiceIntegrationTest {
                         {"stateMachineArn": "%s#HappyPath", "input": "{}"}
                         """.formatted(expressSmArn))
                 .when().post("/");
-        resp.then().statusCode(200);
-        assertEquals("SUCCEEDED", resp.jsonPath().getString("status"));
-        var output = mapper.readTree(resp.jsonPath().getString("output"));
-        assertEquals(200, output.path("StatusCode").asInt());
+        resp.then().statusCode(400);
+        assertTrue(resp.body().asString().contains("not supported for the StartSyncExecution"));
     }
 
     @Test
@@ -219,6 +219,8 @@ class StepFunctionsMockedServiceIntegrationTest {
     @Test
     @Order(7)
     void unknownTestCaseIsRejected() {
+        // Intentional deviation. Step Functions Local 2.0.0 returns a plain HTTP 500 with the
+        // text "No mock map found for test DoesNotExist". Floci returns a structured 400 instead.
         var resp = given()
                 .header("X-Amz-Target", "AWSStepFunctions.StartExecution")
                 .contentType(SFN_CONTENT_TYPE)
@@ -228,6 +230,19 @@ class StepFunctionsMockedServiceIntegrationTest {
                 .when().post("/");
         resp.then().statusCode(400);
         assertTrue(resp.body().asString().contains("DoesNotExist"));
+    }
+
+    @Test
+    @Order(8)
+    void blankSuffixRunsWithoutMocks() {
+        // Verified against Step Functions Local 2.0.0. A bare trailing '#' selects no test case
+        // and the execution runs its real integrations.
+        var execArn = startExecution(mockSmArn + "#", "{}");
+
+        var describe = waitForTerminalState(execArn);
+        assertEquals("FAILED", describe.jsonPath().getString("status"));
+        assertEquals("States.TaskFailed", describe.jsonPath().getString("error"));
+        assertTrue(describe.jsonPath().getString("cause").contains("Unsupported resource"));
     }
 
     private static String createStateMachine(String name, String type, String definition) {
