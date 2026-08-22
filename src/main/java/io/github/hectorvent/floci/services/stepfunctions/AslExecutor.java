@@ -605,7 +605,10 @@ public class AslExecutor {
             String region = extractRegionFromArn(sm.getStateMachineArn());
             LambdaFunction fn = functionStore.get(region, functionName).orElse(null);
             if (fn == null) {
-                throw new RuntimeException("Lambda function not found: " + functionName);
+                // A missing function is a task failure on AWS, so it must stay reachable for
+                // Retry and Catch instead of surfacing as States.Runtime.
+                throw new FailStateException("Lambda.ResourceNotFoundException",
+                        "Lambda function not found: " + functionName);
             }
 
             String payloadStr = objectMapper.writeValueAsString(lambdaPayload);
