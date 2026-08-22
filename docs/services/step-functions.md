@@ -61,9 +61,10 @@ and each retrier keeps its own attempt counter. `Retry` is evaluated before `Cat
 `$$.State.RetryCount` increments per attempt. Attempt counts, defaults, and backoff
 timing were verified against real AWS Step Functions.
 
-Two deviations. The delay between attempts is capped at 30 seconds, the same cap Floci
-applies to `Wait` states, so emulated runs stay fast. `JitterStrategy` is accepted but
-ignored, so delays are deterministic.
+`JitterStrategy` supports `NONE` (the default) and `FULL`. `FULL` draws the delay
+uniformly between zero and the computed delay, as on AWS. One deviation. The delay
+between attempts is capped at 30 seconds, the same cap Floci applies to `Wait` states,
+so emulated runs stay fast.
 
 ## Configuration
 

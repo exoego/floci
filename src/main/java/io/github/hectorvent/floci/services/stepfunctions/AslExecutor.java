@@ -75,6 +75,7 @@ import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
@@ -421,15 +422,28 @@ public class AslExecutor {
     }
 
     private void sleepBeforeRetry(JsonNode retrier, int attemptsUsed) throws InterruptedException {
+        var delaySeconds = retryDelaySeconds(retrier, attemptsUsed, ThreadLocalRandom.current().nextDouble());
+        if (delaySeconds > 0) {
+            Thread.sleep((long) (delaySeconds * 1000));
+        }
+    }
+
+    /**
+     * Computes the delay before a retry attempt. {@code random} is a value in [0, 1) used when
+     * the retrier declares {@code JitterStrategy: FULL}, which draws the delay uniformly between
+     * zero and the computed delay. Jitter applies after the caps, matching AWS.
+     */
+    static double retryDelaySeconds(JsonNode retrier, int attemptsUsed, double random) {
         var interval = retrier.path("IntervalSeconds").asDouble(1.0);
         var backoffRate = retrier.path("BackoffRate").asDouble(2.0);
         var delaySeconds = interval * Math.pow(backoffRate, attemptsUsed - 1.0);
         var maxDelay = retrier.path("MaxDelaySeconds").asDouble(MAX_WAIT_SECONDS);
         // Like the Wait state, cap the delay at MAX_WAIT_SECONDS to keep emulated runs fast.
         delaySeconds = Math.min(delaySeconds, Math.min(maxDelay, MAX_WAIT_SECONDS));
-        if (delaySeconds > 0) {
-            Thread.sleep((long) (delaySeconds * 1000));
+        if ("FULL".equals(retrier.path("JitterStrategy").asText(null))) {
+            delaySeconds *= random;
         }
+        return delaySeconds;
     }
 
     private void updateRetryCount(JsonNode context, int retryCount) {

@@ -353,6 +353,26 @@ class AslExecutorRetryTest {
                 .invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
+    @Test
+    void retryDelayFollowsBackoffAndCaps() throws Exception {
+        assertEquals(10.0, delay("{\"IntervalSeconds\": 10, \"BackoffRate\": 2.0}", 1, 0.5));
+        assertEquals(20.0, delay("{\"IntervalSeconds\": 10, \"BackoffRate\": 2.0}", 2, 0.5));
+        assertEquals(15.0, delay("{\"IntervalSeconds\": 10, \"BackoffRate\": 2.0, \"MaxDelaySeconds\": 15}", 2, 0.5));
+        assertEquals(30.0, delay("{\"IntervalSeconds\": 20, \"BackoffRate\": 2.0}", 2, 0.5));
+    }
+
+    @Test
+    void fullJitterScalesTheDelayByTheRandomFactor() throws Exception {
+        var retrier = "{\"IntervalSeconds\": 10, \"BackoffRate\": 1.0, \"JitterStrategy\": \"FULL\"}";
+        assertEquals(0.0, delay(retrier, 1, 0.0));
+        assertEquals(5.0, delay(retrier, 1, 0.5));
+        assertEquals(10.0, delay("{\"IntervalSeconds\": 10, \"BackoffRate\": 1.0, \"JitterStrategy\": \"NONE\"}", 1, 0.5));
+    }
+
+    private double delay(String retrierJson, int attemptsUsed, double random) throws Exception {
+        return AslExecutor.retryDelaySeconds(objectMapper.readTree(retrierJson), attemptsUsed, random);
+    }
+
     private void failOnceThenSucceed() {
         when(lambdaExecutor.invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult(200, "Handled",
