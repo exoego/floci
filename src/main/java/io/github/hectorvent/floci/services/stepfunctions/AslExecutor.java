@@ -1541,6 +1541,18 @@ public class AslExecutor {
             futures.forEach(future -> future.cancel(true));
             Thread.currentThread().interrupt();
             throw e;
+        } catch (ExecutionException e) {
+            futures.forEach(future -> future.cancel(true));
+            // Unwrap so a branch's FailStateException reaches the Parallel state's own
+            // Retry and Catch handling instead of surfacing as States.Runtime.
+            var cause = e.getCause();
+            if (cause instanceof Exception exception) {
+                throw exception;
+            }
+            if (cause instanceof Error error) {
+                throw error;
+            }
+            throw e;
         } catch (Exception | Error e) {
             futures.forEach(future -> future.cancel(true));
             throw e;
