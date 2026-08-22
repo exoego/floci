@@ -215,7 +215,157 @@ class AslExecutorRetryTest {
                 .invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse));
     }
 
+    @Test
+    void parallelStateRetriesFailingBranch() throws Exception {
+        failOnceThenSucceed();
+
+        var execution = run("""
+                {
+                  "StartAt": "Par",
+                  "States": {
+                    "Par": {
+                      "Type": "Parallel",
+                      "Branches": [{
+                        "StartAt": "Inner",
+                        "States": {"Inner": {"Type": "Task", "Resource": "%s", "End": true}}
+                      }],
+                      "Retry": [{
+                        "ErrorEquals": ["Lambda.AWSLambdaException"],
+                        "IntervalSeconds": 1,
+                        "BackoffRate": 1.0,
+                        "MaxAttempts": 1
+                      }],
+                      "End": true
+                    }
+                  }
+                }
+                """.formatted(FLAKY_FUNCTION_ARN));
+
+        assertEquals("SUCCEEDED", execution.getStatus());
+        assertTrue(objectMapper.readTree(execution.getOutput()).path(0).path("ok").asBoolean());
+        verify(lambdaExecutor, times(2))
+                .invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse));
+    }
+
+    @Test
+    void parallelBranchFailureReachesCatch() throws Exception {
+        when(lambdaExecutor.invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult(200, "Handled",
+                        "{\"errorType\":\"Boom\"}".getBytes(StandardCharsets.UTF_8), null, "req-1"));
+
+        var execution = run("""
+                {
+                  "StartAt": "Par",
+                  "States": {
+                    "Par": {
+                      "Type": "Parallel",
+                      "Branches": [{
+                        "StartAt": "Inner",
+                        "States": {"Inner": {"Type": "Task", "Resource": "%s", "End": true}}
+                      }],
+                      "Catch": [{
+                        "ErrorEquals": ["States.ALL"],
+                        "Next": "HandleError"
+                      }],
+                      "End": true
+                    },
+                    "HandleError": {"Type": "Pass", "End": true}
+                  }
+                }
+                """.formatted(FLAKY_FUNCTION_ARN));
+
+        assertEquals("SUCCEEDED", execution.getStatus());
+        assertEquals("Lambda.AWSLambdaException",
+                objectMapper.readTree(execution.getOutput()).path("Error").asText());
+        verify(lambdaExecutor, times(1))
+                .invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse));
+    }
+
+    @Test
+    void taskInsideParallelBranchRetriesIndependently() throws Exception {
+        failOnceThenSucceed();
+
+        var execution = run("""
+                {
+                  "StartAt": "Par",
+                  "States": {
+                    "Par": {
+                      "Type": "Parallel",
+                      "Branches": [{
+                        "StartAt": "Inner",
+                        "States": {
+                          "Inner": {
+                            "Type": "Task",
+                            "Resource": "%s",
+                            "End": true,
+                            "Retry": [{
+                              "ErrorEquals": ["Lambda.AWSLambdaException"],
+                              "IntervalSeconds": 1,
+                              "BackoffRate": 1.0,
+                              "MaxAttempts": 1
+                            }]
+                          }
+                        }
+                      }],
+                      "End": true
+                    }
+                  }
+                }
+                """.formatted(FLAKY_FUNCTION_ARN));
+
+        assertEquals("SUCCEEDED", execution.getStatus());
+        assertTrue(objectMapper.readTree(execution.getOutput()).path(0).path("ok").asBoolean());
+        verify(lambdaExecutor, times(2))
+                .invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse));
+    }
+
+    @Test
+    void mapStateRetriesFailingIteration() throws Exception {
+        failOnceThenSucceed();
+
+        var execution = run("""
+                {
+                  "StartAt": "Loop",
+                  "States": {
+                    "Loop": {
+                      "Type": "Map",
+                      "ItemsPath": "$.items",
+                      "ItemProcessor": {
+                        "ProcessorConfig": {"Mode": "INLINE"},
+                        "StartAt": "Inner",
+                        "States": {"Inner": {"Type": "Task", "Resource": "%s", "End": true}}
+                      },
+                      "Retry": [{
+                        "ErrorEquals": ["Lambda.AWSLambdaException"],
+                        "IntervalSeconds": 1,
+                        "BackoffRate": 1.0,
+                        "MaxAttempts": 1
+                      }],
+                      "End": true
+                    }
+                  }
+                }
+                """.formatted(FLAKY_FUNCTION_ARN), "{\"items\": [1]}");
+
+        assertEquals("SUCCEEDED", execution.getStatus());
+        assertTrue(objectMapper.readTree(execution.getOutput()).path(0).path("ok").asBoolean());
+        verify(lambdaExecutor, times(2))
+                .invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse));
+    }
+
+    private void failOnceThenSucceed() {
+        when(lambdaExecutor.invoke(eq(flakyFunction), any(byte[].class), eq(InvocationType.RequestResponse)))
+                .thenReturn(new InvokeResult(200, "Handled",
+                        "{\"errorType\":\"Boom\"}".getBytes(StandardCharsets.UTF_8), null, "req-1"))
+                .thenReturn(new InvokeResult(200, null,
+                        "{\"ok\":true}".getBytes(StandardCharsets.UTF_8), null, "req-2"));
+    }
+
     private Execution run(String definition) {
+        return run(definition, "{}");
+    }
+
+    private Execution run(String definition, String input) {
         var stateMachine = new StateMachine();
         stateMachine.setName("retry-test");
         stateMachine.setStateMachineArn("arn:aws:states:%s:%s:stateMachine:retry-test".formatted(REGION, ACCOUNT));
@@ -227,7 +377,7 @@ class AslExecutorRetryTest {
         execution.setExecutionArn(
                 "arn:aws:states:%s:%s:execution:retry-test:retry-test-execution".formatted(REGION, ACCOUNT));
         execution.setStateMachineArn(stateMachine.getStateMachineArn());
-        execution.setInput("{}");
+        execution.setInput(input);
 
         var history = new ArrayList<HistoryEvent>();
         executor.executeSync(stateMachine, execution, history, (updated, events) -> {
