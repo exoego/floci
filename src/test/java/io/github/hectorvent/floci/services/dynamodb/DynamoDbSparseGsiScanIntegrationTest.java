@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -17,15 +18,14 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
- * Regression for floci-io/floci#2275: GSIs are sparse. An item that is missing any GSI key
- * attribute does not exist in the index, so a Scan with IndexName must not return it. The
+ * Regression test for floci-io/floci#2275. GSIs are sparse. An item that is missing any GSI
+ * key attribute is not in the index, so a Scan with IndexName must not return it. The
  * reported case is an item that has the GSI sort key but not the GSI partition key.
  *
- * <p>Also covers the write-time guard that makes the index membership rule airtight: DynamoDB
- * rejects any write whose key attribute value (base table or secondary index) does not match
- * the AttributeDefinitions type, is NULL, or is an empty string. Without that guard such items
- * would surface in an index Scan even though they could never exist in a real index.
- * All expectations, including the exact error messages, verified against real DynamoDB.
+ * <p>Also covers write validation. DynamoDB rejects a write when a key attribute of the
+ * table or an index does not match its AttributeDefinitions type, is NULL, or is an empty
+ * string. Without that check such items would show up in an index Scan. All expectations
+ * and error messages were checked against real DynamoDB.
  */
 @QuarkusTest
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
@@ -96,12 +96,7 @@ class DynamoDbSparseGsiScanIntegrationTest {
             """
         };
         for (var item : items) {
-            given()
-                .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
-                .contentType(DYNAMODB_CONTENT_TYPE)
-                .body("{\"TableName\": \"%s\", \"Item\": %s}".formatted(TABLE, item))
-            .when().post("/")
-            .then().statusCode(200);
+            putItem(TABLE, item).statusCode(200);
         }
     }
 
@@ -134,22 +129,14 @@ class DynamoDbSparseGsiScanIntegrationTest {
     @Test
     @Order(4)
     void itemWithIndexHashButMissingIndexRangeIsAlsoExcluded() throws Exception {
-        given()
-            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
-            .contentType(DYNAMODB_CONTENT_TYPE)
-            .body("""
-                {
-                    "TableName": "%s",
-                    "Item": {
-                        "id": {"S": "record-missing-gsi-sk"},
-                        "sk": {"S": "v1"},
-                        "gsi_pk": {"S": "group-a"},
-                        "label": {"S": "hash-only"}
-                    }
-                }
-                """.formatted(TABLE))
-        .when().post("/")
-        .then().statusCode(200);
+        putItem(TABLE, """
+            {
+                "id": {"S": "record-missing-gsi-sk"},
+                "sk": {"S": "v1"},
+                "gsi_pk": {"S": "group-a"},
+                "label": {"S": "hash-only"}
+            }
+            """).statusCode(200);
 
         var result = scan("""
             {
@@ -165,97 +152,61 @@ class DynamoDbSparseGsiScanIntegrationTest {
     @Test
     @Order(5)
     void putItemRejectsWrongTypeIndexKey() {
-        given()
-            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
-            .contentType(DYNAMODB_CONTENT_TYPE)
-            .body("""
-                {
-                    "TableName": "%s",
-                    "Item": {
-                        "id": {"S": "record-numeric-gsi-pk"},
-                        "sk": {"S": "v1"},
-                        "gsi_pk": {"N": "42"},
-                        "gsi_sk": {"S": "x"}
-                    }
-                }
-                """.formatted(TABLE))
-        .when().post("/")
-        .then().statusCode(400)
-            .body("__type", equalTo("ValidationException"))
-            .body("message", equalTo("One or more parameter values were invalid: "
-                    + "Type mismatch for Index Key gsi_pk Expected: S Actual: N IndexName: " + INDEX));
+        putItemRejected(TABLE, """
+            {
+                "id": {"S": "record-numeric-gsi-pk"},
+                "sk": {"S": "v1"},
+                "gsi_pk": {"N": "42"},
+                "gsi_sk": {"S": "x"}
+            }
+            """,
+            "One or more parameter values were invalid: "
+            + "Type mismatch for Index Key gsi_pk Expected: S Actual: N IndexName: " + INDEX);
     }
 
     @Test
     @Order(6)
     void putItemRejectsNullIndexKey() {
-        given()
-            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
-            .contentType(DYNAMODB_CONTENT_TYPE)
-            .body("""
-                {
-                    "TableName": "%s",
-                    "Item": {
-                        "id": {"S": "record-null-gsi-pk"},
-                        "sk": {"S": "v1"},
-                        "gsi_pk": {"NULL": true},
-                        "gsi_sk": {"S": "x"}
-                    }
-                }
-                """.formatted(TABLE))
-        .when().post("/")
-        .then().statusCode(400)
-            .body("__type", equalTo("ValidationException"))
-            .body("message", equalTo("One or more parameter values were invalid: "
-                    + "Type mismatch for Index Key gsi_pk Expected: S Actual: NULL IndexName: " + INDEX));
+        putItemRejected(TABLE, """
+            {
+                "id": {"S": "record-null-gsi-pk"},
+                "sk": {"S": "v1"},
+                "gsi_pk": {"NULL": true},
+                "gsi_sk": {"S": "x"}
+            }
+            """,
+            "One or more parameter values were invalid: "
+            + "Type mismatch for Index Key gsi_pk Expected: S Actual: NULL IndexName: " + INDEX);
     }
 
     @Test
     @Order(7)
     void putItemRejectsEmptyStringIndexKey() {
-        given()
-            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
-            .contentType(DYNAMODB_CONTENT_TYPE)
-            .body("""
-                {
-                    "TableName": "%s",
-                    "Item": {
-                        "id": {"S": "record-empty-gsi-pk"},
-                        "sk": {"S": "v1"},
-                        "gsi_pk": {"S": ""},
-                        "gsi_sk": {"S": "x"}
-                    }
-                }
-                """.formatted(TABLE))
-        .when().post("/")
-        .then().statusCode(400)
-            .body("__type", equalTo("ValidationException"))
-            .body("message", equalTo("One or more parameter values are not valid. "
-                    + "A value specified for a secondary index key is not supported. "
-                    + "The AttributeValue for a key attribute cannot contain an empty string value. "
-                    + "IndexName: " + INDEX + ", IndexKey: gsi_pk"));
+        putItemRejected(TABLE, """
+            {
+                "id": {"S": "record-empty-gsi-pk"},
+                "sk": {"S": "v1"},
+                "gsi_pk": {"S": ""},
+                "gsi_sk": {"S": "x"}
+            }
+            """,
+            "One or more parameter values are not valid. "
+            + "A value specified for a secondary index key is not supported. "
+            + "The AttributeValue for a key attribute cannot contain an empty string value. "
+            + "IndexName: " + INDEX + ", IndexKey: gsi_pk");
     }
 
     @Test
     @Order(8)
     void putItemRejectsWrongTypeBaseTableKey() {
-        given()
-            .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
-            .contentType(DYNAMODB_CONTENT_TYPE)
-            .body("""
-                {
-                    "TableName": "%s",
-                    "Item": {
-                        "id": {"N": "1"},
-                        "sk": {"S": "v1"}
-                    }
-                }
-                """.formatted(TABLE))
-        .when().post("/")
-        .then().statusCode(400)
-            .body("__type", equalTo("ValidationException"))
-            .body("message", equalTo("One or more parameter values were invalid: "
-                    + "Type mismatch for key id expected: S actual: N"));
+        putItemRejected(TABLE, """
+            {
+                "id": {"N": "1"},
+                "sk": {"S": "v1"}
+            }
+            """,
+            "One or more parameter values were invalid: "
+            + "Type mismatch for key id expected: S actual: N");
     }
 
     @Test
@@ -310,7 +261,7 @@ class DynamoDbSparseGsiScanIntegrationTest {
     @Order(11)
     void transactWriteItemsRejectsWrongTypeIndexKeyWithoutApplyingAnyWrite() throws Exception {
         // AWS cancels with TransactionCanceledException and a ValidationError reason.
-        // Floci raises the same message as a ValidationException; either way the whole
+        // Floci raises the same message as a ValidationException. Either way the whole
         // transaction is rejected before any write is applied.
         given()
             .header("X-Amz-Target", "DynamoDB_20120810.TransactWriteItems")
@@ -340,19 +291,36 @@ class DynamoDbSparseGsiScanIntegrationTest {
         var base = scan("{\"TableName\": \"%s\"}".formatted(TABLE));
         assertEquals(3, base.path("Count").asInt(),
                 "a cancelled transaction must not apply any of its writes: " + base);
-    }
-
-    @Test
-    @Order(12)
-    void rejectedWritesNeverSurfaceInIndexScan() throws Exception {
-        var result = scan("""
+        var gsi = scan("""
             {
                 "TableName": "%s",
                 "IndexName": "%s"
             }
             """.formatted(TABLE, INDEX));
-        assertEquals(1, result.path("Count").asInt(), result.toString());
-        assertEquals("record-with-gsi-keys", result.path("Items").get(0).path("id").path("S").asText());
+        assertEquals(1, gsi.path("Count").asInt(), gsi.toString());
+    }
+
+    @Test
+    @Order(12)
+    void transactWriteItemsRejectsWrongTypeIndexKeyFromUpdate() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.TransactWriteItems")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TransactItems": [
+                        {"Update": {
+                            "TableName": "%s",
+                            "Key": {"id": {"S": "record-with-gsi-keys"}, "sk": {"S": "v1"}},
+                            "UpdateExpression": "SET gsi_pk = :v",
+                            "ExpressionAttributeValues": {":v": {"N": "42"}}
+                        }}
+                    ]
+                }
+                """.formatted(TABLE))
+        .when().post("/")
+        .then().statusCode(400)
+            .body("message", containsString("Type mismatch for Index Key gsi_pk Expected: S Actual: N IndexName: " + INDEX));
     }
 
     // A GSI added by UpdateTable is backfilled over existing items. On AWS an existing
@@ -384,12 +352,7 @@ class DynamoDbSparseGsiScanIntegrationTest {
             "{\"id\": {\"S\": \"no-x\"}}"
         };
         for (var item : items) {
-            given()
-                .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
-                .contentType(DYNAMODB_CONTENT_TYPE)
-                .body("{\"TableName\": \"%s\", \"Item\": %s}".formatted(BACKFILL_TABLE, item))
-            .when().post("/")
-            .then().statusCode(200);
+            putItem(BACKFILL_TABLE, item).statusCode(200);
         }
 
         given()
@@ -429,20 +392,25 @@ class DynamoDbSparseGsiScanIntegrationTest {
     @Test
     @Order(14)
     void writesAfterGsiCreationAreValidatedAgainstItsKeyTypes() {
-        given()
+        putItemRejected(BACKFILL_TABLE, "{\"id\": {\"S\": \"post-gsi-n\"}, \"x\": {\"N\": \"9\"}}",
+                "One or more parameter values were invalid: "
+                + "Type mismatch for Index Key x Expected: S Actual: N IndexName: x-index");
+    }
+
+    private static ValidatableResponse putItem(String table, String itemJson) {
+        return given()
             .header("X-Amz-Target", "DynamoDB_20120810.PutItem")
             .contentType(DYNAMODB_CONTENT_TYPE)
-            .body("""
-                {
-                    "TableName": "%s",
-                    "Item": {"id": {"S": "post-gsi-n"}, "x": {"N": "9"}}
-                }
-                """.formatted(BACKFILL_TABLE))
+            .body("{\"TableName\": \"%s\", \"Item\": %s}".formatted(table, itemJson))
         .when().post("/")
-        .then().statusCode(400)
+        .then();
+    }
+
+    private static void putItemRejected(String table, String itemJson, String expectedMessage) {
+        putItem(table, itemJson)
+            .statusCode(400)
             .body("__type", equalTo("ValidationException"))
-            .body("message", equalTo("One or more parameter values were invalid: "
-                    + "Type mismatch for Index Key x Expected: S Actual: N IndexName: x-index"));
+            .body("message", equalTo(expectedMessage));
     }
 
     private JsonNode scan(String body) throws Exception {

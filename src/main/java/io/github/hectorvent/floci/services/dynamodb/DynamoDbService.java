@@ -531,109 +531,8 @@ public class DynamoDbService {
                 evaluateCondition(existing, conditionExpression, expressionAttrNames, expressionAttrValues, returnValuesOnConditionCheckFailure);
             }
 
-            ObjectNode item;
-            if (existing != null) {
-                item = existing.deepCopy();
-            } else {
-                item = key.deepCopy();
-            }
-
-            // Apply UpdateExpression (modern format: "SET #n = :val, age = :age REMOVE attr")
-            if (updateExpression != null) {
-                applyUpdateExpression(item, updateExpression, expressionAttrNames, expressionAttrValues);
-            }
-            // Apply attribute updates (legacy format: AttributeUpdates)
-            else if (attributeUpdates != null && attributeUpdates.isObject()) {
-                Iterator<Map.Entry<String, JsonNode>> fields = attributeUpdates.fields();
-                while (fields.hasNext()) {
-                    var entry = fields.next();
-                    String attrName = entry.getKey();
-                    JsonNode update = entry.getValue();
-                    String action = update.has("Action") ? update.get("Action").asText() : "PUT";
-                    JsonNode value = update.get("Value");
-
-                    switch (action) {
-                        case "PUT" -> { if (value != null) item.set(attrName, value); }
-                        case "DELETE" -> {
-                            if (value == null) {
-                                item.remove(attrName);
-                            } else {
-                                // Remove elements from a set
-                                JsonNode curAttr = item.get(attrName);
-                                if (curAttr != null) {
-                                    for (String setType : new String[]{"SS", "NS", "BS"}) {
-                                        if (curAttr.has(setType) && value.has(setType)) {
-                                            Set<String> removeSet = new HashSet<>();
-                                            for (JsonNode v : value.get(setType)) removeSet.add(v.asText());
-                                            com.fasterxml.jackson.databind.node.ArrayNode newArr = objectMapper.createArrayNode();
-                                            for (JsonNode v : curAttr.get(setType)) {
-                                                if (!removeSet.contains(v.asText())) newArr.add(v);
-                                            }
-                                            if (newArr.isEmpty()) {
-                                                item.remove(attrName);
-                                            } else {
-                                                ((com.fasterxml.jackson.databind.node.ObjectNode) curAttr).set(setType, newArr);
-                                            }
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        case "ADD" -> {
-                            if (value != null) {
-                                JsonNode curAttr = item.get(attrName);
-                                if (value.has("N")) {
-                                    java.math.BigDecimal delta = new java.math.BigDecimal(value.get("N").asText());
-                                    java.math.BigDecimal current = curAttr != null && curAttr.has("N")
-                                            ? new java.math.BigDecimal(curAttr.get("N").asText()) : java.math.BigDecimal.ZERO;
-                                    com.fasterxml.jackson.databind.node.ObjectNode numNode = objectMapper.createObjectNode();
-                                    numNode.put("N", current.add(delta).stripTrailingZeros().toPlainString());
-                                    item.set(attrName, numNode);
-                                } else {
-                                    // Add elements to a set
-                                    for (String setType : new String[]{"SS", "NS", "BS"}) {
-                                        if (value.has(setType)) {
-                                            if (curAttr == null || !curAttr.has(setType)) {
-                                                item.set(attrName, value);
-                                            } else {
-                                                Set<String> existingSet = new LinkedHashSet<>();
-                                                for (JsonNode v : curAttr.get(setType)) existingSet.add(v.asText());
-                                                for (JsonNode v : value.get(setType)) existingSet.add(v.asText());
-                                                com.fasterxml.jackson.databind.node.ArrayNode newArr = objectMapper.createArrayNode();
-                                                for (String s : existingSet) newArr.add(s);
-                                                ((com.fasterxml.jackson.databind.node.ObjectNode) curAttr).set(setType, newArr);
-                                            }
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Reject any attempt to modify a key attribute
-            String pkName = table.getPartitionKeyName();
-            JsonNode origPk = key.get(pkName);
-            JsonNode newPk = item.get(pkName);
-            if (origPk != null && newPk != null && !origPk.equals(newPk)) {
-                throw new AwsException("ValidationException",
-                        "One or more parameter values were invalid: Cannot update attribute " + pkName
-                        + ". This attribute is part of the key", 400);
-            }
-            String skName = table.getSortKeyName();
-            if (skName != null) {
-                JsonNode origSk = key.get(skName);
-                JsonNode newSk = item.get(skName);
-                if (origSk != null && newSk != null && !origSk.equals(newSk)) {
-                    throw new AwsException("ValidationException",
-                            "One or more parameter values were invalid: Cannot update attribute " + skName
-                            + ". This attribute is part of the key", 400);
-                }
-            }
-
+            var item = computeUpdatedItem(table, key, existing, updateExpression,
+                    attributeUpdates, expressionAttrNames, expressionAttrValues);
             validateKeySchemaTypes(table, item);
 
             items.put(itemKey, item);
@@ -650,6 +549,113 @@ public class DynamoDbService {
 
             return new UpdateResult(item, existing);
         });
+    }
+
+    /**
+     * Computes the item as it would look after the update. Shared by updateItem and the
+     * TransactWriteItems validation pass so both see the same merge result.
+     */
+    private ObjectNode computeUpdatedItem(TableDefinition table, JsonNode key, JsonNode existing,
+                                          String updateExpression, JsonNode attributeUpdates,
+                                          JsonNode expressionAttrNames, JsonNode expressionAttrValues) {
+        var item = (ObjectNode) (existing != null ? existing : key).deepCopy();
+
+        // Apply UpdateExpression (modern format: "SET #n = :val, age = :age REMOVE attr")
+        if (updateExpression != null) {
+            applyUpdateExpression(item, updateExpression, expressionAttrNames, expressionAttrValues);
+        }
+        // Apply attribute updates (legacy format: AttributeUpdates)
+        else if (attributeUpdates != null && attributeUpdates.isObject()) {
+            var fields = attributeUpdates.fields();
+            while (fields.hasNext()) {
+                var entry = fields.next();
+                var attrName = entry.getKey();
+                var update = entry.getValue();
+                var action = update.has("Action") ? update.get("Action").asText() : "PUT";
+                var value = update.get("Value");
+
+                switch (action) {
+                    case "PUT" -> { if (value != null) item.set(attrName, value); }
+                    case "DELETE" -> {
+                        if (value == null) {
+                            item.remove(attrName);
+                        } else {
+                            // Remove elements from a set
+                            var curAttr = item.get(attrName);
+                            if (curAttr != null) {
+                                for (var setType : new String[]{"SS", "NS", "BS"}) {
+                                    if (curAttr.has(setType) && value.has(setType)) {
+                                        var removeSet = new HashSet<String>();
+                                        for (var v : value.get(setType)) removeSet.add(v.asText());
+                                        var newArr = objectMapper.createArrayNode();
+                                        for (var v : curAttr.get(setType)) {
+                                            if (!removeSet.contains(v.asText())) newArr.add(v);
+                                        }
+                                        if (newArr.isEmpty()) {
+                                            item.remove(attrName);
+                                        } else {
+                                            ((ObjectNode) curAttr).set(setType, newArr);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    case "ADD" -> {
+                        if (value != null) {
+                            var curAttr = item.get(attrName);
+                            if (value.has("N")) {
+                                var delta = new java.math.BigDecimal(value.get("N").asText());
+                                var current = curAttr != null && curAttr.has("N")
+                                        ? new java.math.BigDecimal(curAttr.get("N").asText()) : java.math.BigDecimal.ZERO;
+                                var numNode = objectMapper.createObjectNode();
+                                numNode.put("N", current.add(delta).stripTrailingZeros().toPlainString());
+                                item.set(attrName, numNode);
+                            } else {
+                                // Add elements to a set
+                                for (var setType : new String[]{"SS", "NS", "BS"}) {
+                                    if (value.has(setType)) {
+                                        if (curAttr == null || !curAttr.has(setType)) {
+                                            item.set(attrName, value);
+                                        } else {
+                                            var existingSet = new LinkedHashSet<String>();
+                                            for (var v : curAttr.get(setType)) existingSet.add(v.asText());
+                                            for (var v : value.get(setType)) existingSet.add(v.asText());
+                                            var newArr = objectMapper.createArrayNode();
+                                            for (var s : existingSet) newArr.add(s);
+                                            ((ObjectNode) curAttr).set(setType, newArr);
+                                        }
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Reject any attempt to modify a key attribute
+        var pkName = table.getPartitionKeyName();
+        var origPk = key.get(pkName);
+        var newPk = item.get(pkName);
+        if (origPk != null && newPk != null && !origPk.equals(newPk)) {
+            throw new AwsException("ValidationException",
+                    "One or more parameter values were invalid: Cannot update attribute " + pkName
+                    + ". This attribute is part of the key", 400);
+        }
+        var skName = table.getSortKeyName();
+        if (skName != null) {
+            var origSk = key.get(skName);
+            var newSk = item.get(skName);
+            if (origSk != null && newSk != null && !origSk.equals(newSk)) {
+                throw new AwsException("ValidationException",
+                        "One or more parameter values were invalid: Cannot update attribute " + skName
+                        + ". This attribute is part of the key", 400);
+            }
+        }
+        return item;
     }
 
     public QueryResult query(String tableName, JsonNode keyConditions,
@@ -721,15 +727,11 @@ public class DynamoDbService {
                                           expressionAttrValues, exprAttrNames);
         }
 
-        // Sparse index behavior: an item is in the index only if every key attribute is
-        // present, non-NULL, and of the defined type. A type-mismatched attribute can
-        // predate the index (UpdateTable backfill skips such items on AWS).
+        // Sparse index behavior: only items that are in the index are returned.
         if (indexName != null) {
-            String finalPkName = pkName;
-            String finalSkName = skName;
+            var indexKeys = indexKeyTypes(table, pkName, sortKeyNames);
             results = results.stream()
-                    .filter(item -> isIndexKeyValue(table, item, finalPkName))
-                    .filter(item -> finalSkName == null || isIndexKeyValue(table, item, finalSkName))
+                    .filter(item -> isInIndex(item, indexKeys))
                     .toList();
         }
 
@@ -863,16 +865,21 @@ public class DynamoDbService {
         boolean indexScan = indexName != null;
         String lekPkName = pkName;
         String lekSkName = skName;
+        Map<String, String> indexKeys = null;
         if (indexScan) {
             var gsi = table.findGsi(indexName);
             var lsi = table.findLsi(indexName);
+            var indexSortKeys = List.<String>of();
             if (gsi.isPresent()) {
                 lekPkName = gsi.get().getPartitionKeyName();
                 lekSkName = gsi.get().getSortKeyName();
+                indexSortKeys = gsi.get().getSortKeyNames();
             } else if (lsi.isPresent()) {
                 lekPkName = lsi.get().getPartitionKeyName();
                 lekSkName = lsi.get().getSortKeyName();
+                indexSortKeys = lsi.get().getSortKeyNames();
             }
+            indexKeys = indexKeyTypes(table, lekPkName, indexSortKeys);
         }
 
         var source = exclusiveStartKey != null
@@ -887,11 +894,9 @@ public class DynamoDbService {
         JsonNode lastScanned = null;
         for (JsonNode item : source) {
             // Sparse index behavior: a scan of a secondary index reads the index
-            // itself. Base-table items whose key attribute is missing, NULL, or of
-            // the wrong type do not exist in the index — they are never read, never
+            // itself. Items that are not in the index are never read, never
             // counted, and can never anchor a cursor.
-            if (indexScan && !(isIndexKeyValue(table, item, lekPkName)
-                    && (lekSkName == null || isIndexKeyValue(table, item, lekSkName)))) {
+            if (indexScan && !isInIndex(item, indexKeys)) {
                 continue;
             }
             // Stop at whichever boundary the read reaches first: the 1 MB cap or
@@ -2363,7 +2368,6 @@ public class DynamoDbService {
         return ExpressionEvaluator.attributeValuesEqual(a, b);
     }
 
-
     private int compareValues(String a, String b) {
         try {
             return Double.compare(Double.parseDouble(a), Double.parseDouble(b));
@@ -2492,47 +2496,35 @@ public class DynamoDbService {
     }
 
     /**
-     * Rejects writes whose base table or index key attribute value mismatches its
-     * AttributeDefinitions type (NULL included) or is an empty string, mirroring real
-     * DynamoDB messages. Keeps un-indexable items out of index Scans (floci-io/floci#2275).
+     * Rejects a write when a key attribute of the table or an index does not match its
+     * AttributeDefinitions type. NULL counts as a mismatch. Index keys also reject the
+     * empty string here. Empty base table keys are rejected in buildItemKey. Messages
+     * match real DynamoDB (floci-io/floci#2275).
      */
     private void validateKeySchemaTypes(TableDefinition table, JsonNode item) {
-        validateBaseKeyType(table, item, table.getPartitionKeyName());
+        validateKeyType(table, item, table.getPartitionKeyName(), null);
         for (var skName : table.getSortKeyNames()) {
-            validateBaseKeyType(table, item, skName);
+            validateKeyType(table, item, skName, null);
         }
         if (table.getGlobalSecondaryIndexes() != null) {
             for (var gsi : table.getGlobalSecondaryIndexes()) {
-                validateIndexKeyType(table, item, gsi.getIndexName(), gsi.getPartitionKeyName());
+                validateKeyType(table, item, gsi.getPartitionKeyName(), gsi.getIndexName());
                 for (var skName : gsi.getSortKeyNames()) {
-                    validateIndexKeyType(table, item, gsi.getIndexName(), skName);
+                    validateKeyType(table, item, skName, gsi.getIndexName());
                 }
             }
         }
         if (table.getLocalSecondaryIndexes() != null) {
             for (var lsi : table.getLocalSecondaryIndexes()) {
-                validateIndexKeyType(table, item, lsi.getIndexName(), lsi.getPartitionKeyName());
+                // The LSI partition key is the table partition key, validated above.
                 for (var skName : lsi.getSortKeyNames()) {
-                    validateIndexKeyType(table, item, lsi.getIndexName(), skName);
+                    validateKeyType(table, item, skName, lsi.getIndexName());
                 }
             }
         }
     }
 
-    private void validateBaseKeyType(TableDefinition table, JsonNode item, String keyName) {
-        var actual = attributeValueType(item.get(keyName));
-        if (actual == null) {
-            return;
-        }
-        var expected = definedAttributeType(table, keyName);
-        if (expected != null && !expected.equals(actual)) {
-            throw new AwsException("ValidationException",
-                    "One or more parameter values were invalid: Type mismatch for key " + keyName
-                    + " expected: " + expected + " actual: " + actual, 400);
-        }
-    }
-
-    private void validateIndexKeyType(TableDefinition table, JsonNode item, String indexName, String keyName) {
+    private void validateKeyType(TableDefinition table, JsonNode item, String keyName, String indexName) {
         var attr = item.get(keyName);
         var actual = attributeValueType(attr);
         if (actual == null) {
@@ -2540,11 +2532,16 @@ public class DynamoDbService {
         }
         var expected = definedAttributeType(table, keyName);
         if (expected != null && !expected.equals(actual)) {
+            if (indexName == null) {
+                throw new AwsException("ValidationException",
+                        "One or more parameter values were invalid: Type mismatch for key " + keyName
+                        + " expected: " + expected + " actual: " + actual, 400);
+            }
             throw new AwsException("ValidationException",
                     "One or more parameter values were invalid: Type mismatch for Index Key " + keyName
                     + " Expected: " + expected + " Actual: " + actual + " IndexName: " + indexName, 400);
         }
-        if ("S".equals(actual) && attr.get("S").asText().isEmpty()) {
+        if (indexName != null && "S".equals(actual) && attr.get("S").asText().isEmpty()) {
             throw new AwsException("ValidationException",
                     "One or more parameter values are not valid. "
                     + "A value specified for a secondary index key is not supported. "
@@ -2553,17 +2550,32 @@ public class DynamoDbService {
         }
     }
 
-    /**
-     * True if the item can appear in an index keyed on this attribute. The value must be
-     * present, non-NULL, and match the AttributeDefinitions type when one is defined.
-     */
-    private boolean isIndexKeyValue(TableDefinition table, JsonNode item, String attrName) {
-        var attr = item.get(attrName);
-        if (attr == null || attr.has("NULL")) {
-            return false;
+    /** Resolves the key attribute names of an index to their expected types, for isInIndex. */
+    private Map<String, String> indexKeyTypes(TableDefinition table, String pkName, List<String> skNames) {
+        var keyTypes = new HashMap<String, String>();
+        keyTypes.put(pkName, definedAttributeType(table, pkName));
+        for (var skName : skNames) {
+            keyTypes.put(skName, definedAttributeType(table, skName));
         }
-        var expected = definedAttributeType(table, attrName);
-        return expected == null || expected.equals(attributeValueType(attr));
+        return keyTypes;
+    }
+
+    /**
+     * True if the item is in an index with the given key types. Every key attribute must
+     * be present, not NULL, and of the expected type. A wrong-typed value can exist when
+     * the index was added after the item, because AWS backfill skips such items.
+     */
+    private static boolean isInIndex(JsonNode item, Map<String, String> indexKeyTypes) {
+        for (var keyType : indexKeyTypes.entrySet()) {
+            var attr = item.get(keyType.getKey());
+            if (attr == null || attr.has("NULL")) {
+                return false;
+            }
+            if (keyType.getValue() != null && !keyType.getValue().equals(attributeValueType(attr))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static String attributeValueType(JsonNode attr) {
@@ -2587,7 +2599,8 @@ public class DynamoDbService {
     private void validateTransactWriteKeys(JsonNode transactItem, String region) {
         var put = transactItem.get("Put");
         if (put != null) {
-            var table = transactTable(put, region);
+            var canonicalTableName = canonicalTableName(region, put.path("TableName").asText());
+            var table = tableStore.get(regionKey(region, canonicalTableName)).orElse(null);
             var item = put.get("Item");
             if (table != null && item != null) {
                 validateKeySchemaTypes(table, item);
@@ -2595,28 +2608,26 @@ public class DynamoDbService {
             return;
         }
         var upd = transactItem.get("Update");
-        if (upd != null) {
-            var table = transactTable(upd, region);
-            var key = upd.get("Key");
-            if (table == null || key == null || !key.isObject()) {
-                return;
-            }
-            var canonicalTableName = canonicalTableName(region, upd.path("TableName").asText());
-            var tableItems = itemsByTable.get(scopedItemsKey(regionKey(region, canonicalTableName)));
-            var existing = tableItems != null ? tableItems.get(buildItemKey(table, key)) : null;
-            var merged = (ObjectNode) (existing != null ? existing : key).deepCopy();
-            if (upd.has("UpdateExpression")) {
-                applyUpdateExpression(merged, upd.get("UpdateExpression").asText(),
-                        upd.has("ExpressionAttributeNames") ? upd.get("ExpressionAttributeNames") : null,
-                        upd.has("ExpressionAttributeValues") ? upd.get("ExpressionAttributeValues") : null);
-            }
-            validateKeySchemaTypes(table, merged);
+        if (upd == null) {
+            return;
         }
-    }
-
-    private TableDefinition transactTable(JsonNode target, String region) {
-        var canonicalTableName = canonicalTableName(region, target.path("TableName").asText());
-        return tableStore.get(regionKey(region, canonicalTableName)).orElse(null);
+        var key = upd.get("Key");
+        if (key == null || !key.isObject()) {
+            return;
+        }
+        var canonicalTableName = canonicalTableName(region, upd.path("TableName").asText());
+        var storageKey = regionKey(region, canonicalTableName);
+        var table = tableStore.get(storageKey).orElse(null);
+        if (table == null) {
+            return;
+        }
+        var tableItems = itemsByTable.get(scopedItemsKey(storageKey));
+        var existing = tableItems != null ? tableItems.get(buildItemKey(table, key, true)) : null;
+        var updateExpression = upd.has("UpdateExpression") ? upd.get("UpdateExpression").asText() : null;
+        var merged = computeUpdatedItem(table, key, existing, updateExpression, null,
+                upd.has("ExpressionAttributeNames") ? upd.get("ExpressionAttributeNames") : null,
+                upd.has("ExpressionAttributeValues") ? upd.get("ExpressionAttributeValues") : null);
+        validateKeySchemaTypes(table, merged);
     }
 
     private String buildItemKeyFromNode(JsonNode item, String pkName, String skName) {
