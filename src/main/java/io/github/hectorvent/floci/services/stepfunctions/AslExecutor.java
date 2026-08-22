@@ -1508,13 +1508,16 @@ public class AslExecutor {
             // Each branch gets an isolated copy of the current variables: assignments inside a
             // branch are scoped to that branch and do not leak back to the parent after the state.
             ObjectNode branchVariables = variables.deepCopy();
+            // Each branch also gets its own copy of the context object so State.RetryCount and
+            // Task.Token writes cannot race across concurrent branches.
+            var branchContext = ((ObjectNode) context).deepCopy();
 
             // Run each branch on its own worker thread under the execution's account: the request
             // scope is thread-bound, so without this a branch's Task integrations would resolve to
             // the default account rather than the execution's.
             futures.add(executor.submit(() -> callUnderExecutionAccount(sm,
-                    () -> executeBranch(startAt, branchStates, capturedInput, sm, topLevelQueryLanguage, context,
-                            branchVariables))));
+                    () -> executeBranch(startAt, branchStates, capturedInput, sm, topLevelQueryLanguage,
+                            branchContext, branchVariables))));
         }
 
         int timeoutSeconds = stateDef.path("TimeoutSeconds").asInt(0);
@@ -2074,6 +2077,7 @@ public class AslExecutor {
             }
             String type = stateDef.path("Type").asText();
             boolean stateJsonata = isJsonata(stateDef, topLevelQueryLanguage);
+            updateStateContext(context, currentState);
             StateResult result;
             try {
                 result = executeStateWithRetry(currentState, type, stateDef, currentInput, ignored, eventId, sm,
