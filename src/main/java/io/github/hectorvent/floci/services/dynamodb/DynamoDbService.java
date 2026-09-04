@@ -2499,18 +2499,13 @@ public class DynamoDbService implements ResourceProvider {
                 JsonNode child = obj.get(attrName);
                 if (last) {
                     if (nextTok instanceof String finalAttr) {
-                        if (child == null) {
-                            ObjectNode newMap = objectMapper.createObjectNode();
-                            newMap.set(finalAttr, value);
-                            ObjectNode wrapper = objectMapper.createObjectNode();
-                            wrapper.set("M", newMap);
-                            obj.set(attrName, wrapper);
-                        } else if (!child.has("M")) {
+                        // AWS requires every intermediate of a document path to already
+                        // exist as the right type; only the final element may be new.
+                        if (child == null || !child.has("M")) {
                             throw new AwsException("ValidationException",
                                     "The document path provided in the update expression is invalid for update", 400);
-                        } else {
-                            ((ObjectNode) child.get("M")).set(finalAttr, value);
                         }
+                        ((ObjectNode) child.get("M")).set(finalAttr, value);
                     } else if (nextTok instanceof Integer finalIdx) {
                         if (child == null || !child.has("L")) throw new AwsException("ValidationException",
                                 "The document path provided in the update expression is invalid for update", 400);
@@ -2519,18 +2514,11 @@ public class DynamoDbService implements ResourceProvider {
                     return;
                 }
                 if (nextTok instanceof String) {
-                    if (child == null) {
-                        ObjectNode newMap = objectMapper.createObjectNode();
-                        ObjectNode wrapper = objectMapper.createObjectNode();
-                        wrapper.set("M", newMap);
-                        obj.set(attrName, wrapper);
-                        container = newMap;
-                    } else if (!child.has("M")) {
+                    if (child == null || !child.has("M")) {
                         throw new AwsException("ValidationException",
                                 "The document path provided in the update expression is invalid for update", 400);
-                    } else {
-                        container = child.get("M");
                     }
+                    container = child.get("M");
                 } else if (nextTok instanceof Integer) {
                     if (child == null || !child.has("L")) throw new AwsException("ValidationException",
                             "The document path provided in the update expression is invalid for update", 400);

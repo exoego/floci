@@ -451,7 +451,28 @@ final class ExpressionEvaluator {
             case OrExpr o -> o.operands().forEach(x -> validateSemantics(x, exprType, names, values));
             case NotExpr n -> validateSemantics(n.operand(), exprType, names, values);
             case FunctionCallExpr f -> validateFunction(f, exprType, names, values);
+            case BetweenExpr b -> validateBetweenBounds(b, exprType, values);
             default -> {}
+        }
+    }
+
+    // DynamoDB rejects a BETWEEN whose lower bound exceeds its upper bound at parse
+    // time, before any item is evaluated. Only same-typed literal bounds can be
+    // ordered without the item, so the check is limited to that case.
+    private static void validateBetweenBounds(BetweenExpr between, String exprType, JsonNode values) {
+        String lowType = operandValueType(between.low(), values);
+        String highType = operandValueType(between.high(), values);
+        if (lowType == null || !lowType.equals(highType)) {
+            return;
+        }
+        JsonNode low = values.get(((PlaceholderOperand) between.low()).name());
+        JsonNode high = values.get(((PlaceholderOperand) between.high()).name());
+        if (compareAttributeValues(low, high) > 0) {
+            throw new AwsException("ValidationException",
+                    "Invalid " + exprType + ": The BETWEEN operator requires upper bound to be greater than "
+                    + "or equal to lower bound; lower bound operand: "
+                    + ((PlaceholderOperand) between.low()).name() + ", upper bound operand: "
+                    + ((PlaceholderOperand) between.high()).name(), 400);
         }
     }
 
