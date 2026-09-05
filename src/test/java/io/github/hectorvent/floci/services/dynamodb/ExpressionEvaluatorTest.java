@@ -619,5 +619,43 @@ class ExpressionEvaluatorTest {
             assertEquals("ValidationException", e.getErrorCode());
             assertTrue(e.getMessage().contains("Invalid ConditionExpression: Syntax error"), e.getMessage());
         }
+
+        // DynamoDB rejects a BETWEEN whose literal bounds are reversed at parse time,
+        // before any item is evaluated (paritysuite dynamodb-conformance tier1).
+
+        @Test
+        void reversedBetweenBoundsThrowAtParseTime() {
+            ObjectNode values = mapper.createObjectNode();
+            values.set(":hi", numberValue("10"));
+            values.set(":lo", numberValue("1"));
+            AwsException e = assertThrows(AwsException.class, () ->
+                    ExpressionEvaluator.validateExpression("a BETWEEN :hi AND :lo", "ConditionExpression", null, values));
+            assertEquals("ValidationException", e.getErrorCode());
+            assertEquals("Invalid ConditionExpression: The BETWEEN operator requires upper bound to be "
+                    + "greater than or equal to lower bound; lower bound operand: :hi, upper bound operand: :lo",
+                    e.getMessage());
+        }
+
+        @Test
+        void orderedBetweenBoundsPassValidation() {
+            ObjectNode values = mapper.createObjectNode();
+            values.set(":lo", numberValue("1"));
+            values.set(":hi", numberValue("10"));
+            assertDoesNotThrow(() ->
+                    ExpressionEvaluator.validateExpression("a BETWEEN :lo AND :hi", "ConditionExpression", null, values));
+        }
+
+        @Test
+        void betweenBoundsOfDifferentTypesSkipTheOrderCheck() {
+            ObjectNode values = mapper.createObjectNode();
+            values.set(":lo", mapper.createObjectNode().put("S", "z"));
+            values.set(":hi", numberValue("1"));
+            assertDoesNotThrow(() ->
+                    ExpressionEvaluator.validateExpression("a BETWEEN :lo AND :hi", "ConditionExpression", null, values));
+        }
+
+        private ObjectNode numberValue(String value) {
+            return mapper.createObjectNode().put("N", value);
+        }
     }
 }
