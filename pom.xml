@@ -462,7 +462,6 @@
                     <argLine>-Xmx6g</argLine>
                     <systemPropertyVariables>
                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
-                        <com.mysql.cj.disableAbandonedConnectionCleanup>true</com.mysql.cj.disableAbandonedConnectionCleanup>
                     </systemPropertyVariables>
                 </configuration>
             </plugin>
