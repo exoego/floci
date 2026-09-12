@@ -2364,16 +2364,27 @@ public class AslExecutor {
             mapCtx.set("Item", mapItem);
             iterContext.set("Map", mapCtx);
 
+            // AWS evaluates ItemSelector before it records MapIterationStarted, so a failing
+            // expression fails the Map state without any event for that iteration.
+            var iterInput = item;
+            if (itemTransform != null) {
+                try {
+                    // $ in ItemSelector resolves against the Map state's effective input, not the item.
+                    iterInput = jsonata
+                            ? jsonataEvaluator.resolveTemplate(itemTransform, "ItemSelector",
+                                    buildStatesVar(mapInput, null, iterContext), variables)
+                            : resolveParameters(itemTransform, mapInput, iterContext);
+                } catch (FailStateException e) {
+                    failedItems.incrementAndGet();
+                    throw new IterationFailure(i, e);
+                }
+            }
+
             long startMs = hasResultWriter ? System.currentTimeMillis() : 0L;
             JsonNode branchOutput;
             try {
                 if (!distributed) {
                     iterationChain.publish("MapIterationStarted", Map.of("name", name, "index", i));
-                }
-                JsonNode iterInput = item;
-                if (itemTransform != null) {
-                    // $ in ItemSelector resolves against the Map state's effective input, not the item.
-                    iterInput = resolveParameters(itemTransform, mapInput, iterContext);
                 }
                 if (hasResultWriter) {
                     childInputsByIndex[i] = iterInput;
