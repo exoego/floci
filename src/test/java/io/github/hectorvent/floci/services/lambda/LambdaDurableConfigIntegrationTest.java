@@ -78,7 +78,6 @@ class LambdaDurableConfigIntegrationTest {
         createFunction("durable-explicit-fn", """
             ,
                 "Timeout": 3,
-                "LoggingConfig": {"LogFormat": "Text"},
                 "DurableConfig": {
                     "ExecutionTimeout": 60,
                     "RetentionPeriodInDays": 7,
@@ -91,10 +90,74 @@ class LambdaDurableConfigIntegrationTest {
         .then()
             .statusCode(200)
             .body("Timeout", equalTo(3))
-            .body("LoggingConfig.LogFormat", equalTo("Text"))
             .body("DurableConfig.ExecutionTimeout", equalTo(60))
             .body("DurableConfig.RetentionPeriodInDays", equalTo(7))
             .body("DurableConfig.KMSKeyArn", equalTo(KMS_KEY_ARN));
+    }
+
+    @Test
+    void emptyKmsKeyArnMeansNoKey() {
+        given()
+            .contentType("application/json")
+            .body(functionJson("durable-no-key-fn", """
+                ,
+                    "DurableConfig": {"ExecutionTimeout": 60, "KMSKeyArn": ""}"""))
+        .when()
+            .post(BASE_PATH + "/functions")
+        .then()
+            .statusCode(201)
+            .body("DurableConfig", not(hasKey("KMSKeyArn")));
+    }
+
+    @Test
+    void durableFunctionLogsInJsonFormatOnly() {
+        String textLogsMessage = "You cannot use plain text logs with a durable function. "
+                + "Only JSON format logs are supported";
+        given()
+            .contentType("application/json")
+            .body(functionJson("durable-text-logs-fn", """
+                ,
+                    "LoggingConfig": {"LogFormat": "Text"},
+                    "DurableConfig": {"ExecutionTimeout": 60}"""))
+        .when()
+            .post(BASE_PATH + "/functions")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidParameterValueException"))
+            .body("message", equalTo(textLogsMessage));
+
+        given()
+            .contentType("application/json")
+            .body(functionJson("durable-partial-logs-fn", """
+                ,
+                    "LoggingConfig": {"LogGroup": "/custom/durable"},
+                    "DurableConfig": {"ExecutionTimeout": 60}"""))
+        .when()
+            .post(BASE_PATH + "/functions")
+        .then()
+            .statusCode(201)
+            .body("LoggingConfig.LogFormat", equalTo("JSON"))
+            .body("LoggingConfig.LogGroup", equalTo("/custom/durable"));
+
+        given()
+            .contentType("application/json")
+            .body("{\"LoggingConfig\": {\"LogFormat\": \"Text\"}}")
+        .when()
+            .put(BASE_PATH + "/functions/durable-partial-logs-fn/configuration")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidParameterValueException"))
+            .body("message", equalTo(textLogsMessage));
+
+        given()
+            .contentType("application/json")
+            .body("{\"LoggingConfig\": {\"LogGroup\": \"/custom/updated\"}}")
+        .when()
+            .put(BASE_PATH + "/functions/durable-partial-logs-fn/configuration")
+        .then()
+            .statusCode(200)
+            .body("LoggingConfig.LogFormat", equalTo("JSON"))
+            .body("LoggingConfig.LogGroup", equalTo("/custom/updated"));
     }
 
     @Test

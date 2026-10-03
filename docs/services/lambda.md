@@ -701,10 +701,10 @@ is a permanent diff rather than a cosmetic omission.
 `LogFormat` resets `LogGroup` to the default.
 
 `DurableConfig` requires `ExecutionTimeout` on create. A durable function created without
-a `Timeout` gets `min(ExecutionTimeout, 900)`, and without a `LoggingConfig` logs in JSON
-format. On update the members are merged, and a function created without `DurableConfig`
-cannot gain one. The durable execution itself (checkpoints, waits, callbacks) is not
-emulated yet; the configuration only round-trips.
+a `Timeout` gets `min(ExecutionTimeout, 900)`. It always logs in JSON format, and
+`LogFormat: Text` is rejected. On update the members are merged, and a function created
+without `DurableConfig` cannot gain one. The durable execution itself (checkpoints, waits,
+callbacks) is not emulated yet; the configuration only round-trips.
 
 `LogGroup` is validated against AWS's documented constraint: 1-512 characters matching
 `[.\-_/#A-Za-z0-9]+`. `ApplicationLogLevel` and `SystemLogLevel` are accepted with any

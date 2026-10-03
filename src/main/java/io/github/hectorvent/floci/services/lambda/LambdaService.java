@@ -426,6 +426,9 @@ public class LambdaService implements ResourceProvider {
             throw new AwsException("InvalidParameterValueException",
                     "You cannot create a function with a durable configuration without an executionTimeout", 400);
         }
+        if (durable != null) {
+            validateDurableLogging(loggingConfig);
+        }
         int defaultTimeout = config != null ? config.services().lambda().defaultTimeoutSeconds() : 3;
         if (durable != null) {
             // A durable function's Timeout defaults to its ExecutionTimeout, capped at the 15 minute limit.
@@ -530,7 +533,7 @@ public class LambdaService implements ResourceProvider {
 
         applySnapStart(fn, snapStart);
         applyLoggingConfig(fn, loggingConfig);
-        applyDurableConfig(fn, durable, loggingConfig == null);
+        applyDurableConfig(fn, durable);
 
         List<LambdaFileSystemConfig> fileSystemConfigs =
                 parseFileSystemConfigs(request.get("FileSystemConfigs"));
@@ -819,6 +822,9 @@ public class LambdaService implements ResourceProvider {
         }
         if (request.containsKey("LoggingConfig")) {
             validateLoggingConfig(loggingConfig);
+            if (fn.isDurable()) {
+                validateDurableLogging(loggingConfig);
+            }
         }
         DurableConfigRequest durable = null;
         if (durableConfig != null) {
@@ -931,6 +937,9 @@ public class LambdaService implements ResourceProvider {
 
         if (request.containsKey("LoggingConfig")) {
             applyLoggingConfig(fn, loggingConfig);
+            if (fn.isDurable()) {
+                fn.setLogFormat("JSON");
+            }
         }
 
         if (durable != null) {
@@ -2521,11 +2530,17 @@ public class LambdaService implements ResourceProvider {
         return (int) number;
     }
 
-    /**
-     * CreateFunction: RetentionPeriodInDays defaults to 14 days, and a durable function created without a
-     * LoggingConfig logs in JSON format, where a plain function logs as Text.
-     */
-    private static void applyDurableConfig(LambdaFunction fn, DurableConfigRequest durable, boolean defaultLogging) {
+    /** A durable function logs in JSON format only; Text is rejected and an unset LogFormat means JSON. */
+    private static void validateDurableLogging(Map<String, Object> loggingConfig) {
+        if (loggingConfig != null && "Text".equals(loggingConfig.get("LogFormat"))) {
+            throw new AwsException("InvalidParameterValueException",
+                    "You cannot use plain text logs with a durable function. Only JSON format logs are supported",
+                    400);
+        }
+    }
+
+    /** CreateFunction: RetentionPeriodInDays defaults to 14 days and the log format is always JSON. */
+    private static void applyDurableConfig(LambdaFunction fn, DurableConfigRequest durable) {
         if (durable == null) {
             return;
         }
@@ -2533,9 +2548,7 @@ public class LambdaService implements ResourceProvider {
         fn.setDurableRetentionPeriodInDays(durable.retentionPeriodInDays() != null
                 ? durable.retentionPeriodInDays() : DEFAULT_DURABLE_RETENTION_DAYS);
         fn.setDurableKmsKeyArn(durable.kmsKeyArn() == null || durable.kmsKeyArn().isEmpty() ? null : durable.kmsKeyArn());
-        if (defaultLogging) {
-            fn.setLogFormat("JSON");
-        }
+        fn.setLogFormat("JSON");
     }
 
     /** UpdateFunctionConfiguration merges DurableConfig per member; a member left out keeps its stored value. */
