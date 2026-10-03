@@ -323,7 +323,9 @@ class LambdaFunctionConfigTest {
         } finally {
             try {
                 lambda.deleteFunction(DeleteFunctionRequest.builder().functionName(durableFn).build());
-            } catch (Exception ignored) {}
+            } catch (Exception ignored) {
+                // Cleanup only. A failed delete must not hide the test result.
+            }
         }
     }
 }
