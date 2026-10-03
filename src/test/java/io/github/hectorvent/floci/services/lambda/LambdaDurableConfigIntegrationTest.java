@@ -11,7 +11,7 @@ import static org.hamcrest.Matchers.not;
 
 /**
  * DurableConfig marks a function as a durable function. It is accepted by CreateFunction and
- * UpdateFunctionConfiguration, snapshotted by PublishVersion, and echoed by every read, while a
+ * UpdateFunctionConfiguration, snapshotted by PublishVersion, and returned by every read, while a
  * plain function never carries the member.
  */
 @QuarkusTest
@@ -20,38 +20,54 @@ class LambdaDurableConfigIntegrationTest {
     private static final String BASE_PATH = "/2015-03-31";
     private static final String KMS_KEY_ARN =
             "arn:aws:kms:us-east-1:000000000000:key/11111111-1111-1111-1111-111111111111";
+    private static final String TEXT_LOGS_MESSAGE = "You cannot use plain text logs with a durable function. "
+            + "Only JSON format logs are supported";
 
-    private static String functionJson(String name, String extraJson) {
-        return """
+    /** Posts CreateFunction for {@code name}; {@code members} are extra JSON members, already comma separated. */
+    private static ValidatableResponse createFunction(String name, String members) {
+        String body = """
             {
                 "FunctionName": "%s",
                 "Runtime": "nodejs20.x",
                 "Role": "arn:aws:iam::000000000000:role/lambda-role",
                 "Handler": "index.handler"%s
             }
-            """.formatted(name, extraJson);
-    }
-
-    private static void createFunction(String name, String extraJson) {
-        given()
+            """.formatted(name, members.isEmpty() ? "" : ",\n" + members);
+        return given()
             .contentType("application/json")
-            .body(functionJson(name, extraJson))
+            .body(body)
         .when()
             .post(BASE_PATH + "/functions")
-        .then()
-            .statusCode(201);
+        .then();
+    }
+
+    private static ValidatableResponse createDurableFunction(String name, String durableConfig) {
+        return createFunction(name, "\"DurableConfig\": " + durableConfig);
+    }
+
+    private static ValidatableResponse updateConfiguration(String name, String body) {
+        return given()
+            .contentType("application/json")
+            .body(body)
+        .when()
+            .put(BASE_PATH + "/functions/" + name + "/configuration")
+        .then();
+    }
+
+    private static ValidatableResponse getConfiguration(String name) {
+        return getConfiguration(name, "");
+    }
+
+    private static ValidatableResponse getConfiguration(String name, String query) {
+        return given()
+        .when()
+            .get(BASE_PATH + "/functions/" + name + "/configuration" + query)
+        .then();
     }
 
     @Test
     void createDefaultsRetentionTimeoutAndJsonLogging() {
-        given()
-            .contentType("application/json")
-            .body(functionJson("durable-defaults-fn", """
-                ,
-                    "DurableConfig": {"ExecutionTimeout": 3600}"""))
-        .when()
-            .post(BASE_PATH + "/functions")
-        .then()
+        createDurableFunction("durable-defaults-fn", "{\"ExecutionTimeout\": 3600}")
             .statusCode(201)
             .body("DurableConfig.ExecutionTimeout", equalTo(3600))
             .body("DurableConfig.RetentionPeriodInDays", equalTo(14))
@@ -61,14 +77,7 @@ class LambdaDurableConfigIntegrationTest {
             .body("LoggingConfig.ApplicationLogLevel", equalTo("INFO"))
             .body("LoggingConfig.SystemLogLevel", equalTo("INFO"));
 
-        given()
-            .contentType("application/json")
-            .body(functionJson("durable-short-timeout-fn", """
-                ,
-                    "DurableConfig": {"ExecutionTimeout": 60}"""))
-        .when()
-            .post(BASE_PATH + "/functions")
-        .then()
+        createDurableFunction("durable-short-timeout-fn", "{\"ExecutionTimeout\": 60}")
             .statusCode(201)
             .body("Timeout", equalTo(60));
     }
@@ -76,18 +85,15 @@ class LambdaDurableConfigIntegrationTest {
     @Test
     void createKeepsExplicitMembers() {
         createFunction("durable-explicit-fn", """
-            ,
                 "Timeout": 3,
                 "DurableConfig": {
                     "ExecutionTimeout": 60,
                     "RetentionPeriodInDays": 7,
                     "KMSKeyArn": "%s"
-                }""".formatted(KMS_KEY_ARN));
+                }""".formatted(KMS_KEY_ARN))
+            .statusCode(201);
 
-        given()
-        .when()
-            .get(BASE_PATH + "/functions/durable-explicit-fn/configuration")
-        .then()
+        getConfiguration("durable-explicit-fn")
             .statusCode(200)
             .body("Timeout", equalTo(3))
             .body("DurableConfig.ExecutionTimeout", equalTo(60))
@@ -97,64 +103,40 @@ class LambdaDurableConfigIntegrationTest {
 
     @Test
     void emptyKmsKeyArnMeansNoKey() {
-        given()
-            .contentType("application/json")
-            .body(functionJson("durable-no-key-fn", """
-                ,
-                    "DurableConfig": {"ExecutionTimeout": 60, "KMSKeyArn": ""}"""))
-        .when()
-            .post(BASE_PATH + "/functions")
-        .then()
+        createDurableFunction("durable-no-key-fn", "{\"ExecutionTimeout\": 60, \"KMSKeyArn\": \"\"}")
             .statusCode(201)
             .body("DurableConfig", not(hasKey("KMSKeyArn")));
     }
 
     @Test
     void durableFunctionLogsInJsonFormatOnly() {
-        String textLogsMessage = "You cannot use plain text logs with a durable function. "
-                + "Only JSON format logs are supported";
-        given()
-            .contentType("application/json")
-            .body(functionJson("durable-text-logs-fn", """
-                ,
-                    "LoggingConfig": {"LogFormat": "Text"},
-                    "DurableConfig": {"ExecutionTimeout": 60}"""))
-        .when()
-            .post(BASE_PATH + "/functions")
-        .then()
+        createFunction("durable-text-logs-fn", """
+                "LoggingConfig": {"LogFormat": "Text"},
+                "DurableConfig": {"ExecutionTimeout": 60}""")
             .statusCode(400)
             .body("__type", equalTo("InvalidParameterValueException"))
-            .body("message", equalTo(textLogsMessage));
+            .body("message", equalTo(TEXT_LOGS_MESSAGE));
 
-        given()
-            .contentType("application/json")
-            .body(functionJson("durable-partial-logs-fn", """
-                ,
-                    "LoggingConfig": {"LogGroup": "/custom/durable"},
-                    "DurableConfig": {"ExecutionTimeout": 60}"""))
-        .when()
-            .post(BASE_PATH + "/functions")
-        .then()
+        createFunction("durable-partial-logs-fn", """
+                "LoggingConfig": {"LogGroup": "/custom/durable"},
+                "DurableConfig": {"ExecutionTimeout": 60}""")
             .statusCode(201)
             .body("LoggingConfig.LogFormat", equalTo("JSON"))
             .body("LoggingConfig.LogGroup", equalTo("/custom/durable"));
 
-        given()
-            .contentType("application/json")
-            .body("{\"LoggingConfig\": {\"LogFormat\": \"Text\"}}")
-        .when()
-            .put(BASE_PATH + "/functions/durable-partial-logs-fn/configuration")
-        .then()
+        createFunction("durable-json-levels-fn", """
+                "LoggingConfig": {"LogFormat": "JSON", "ApplicationLogLevel": "WARN"},
+                "DurableConfig": {"ExecutionTimeout": 60}""")
+            .statusCode(201)
+            .body("LoggingConfig.ApplicationLogLevel", equalTo("WARN"))
+            .body("LoggingConfig.SystemLogLevel", equalTo("INFO"));
+
+        updateConfiguration("durable-partial-logs-fn", "{\"LoggingConfig\": {\"LogFormat\": \"Text\"}}")
             .statusCode(400)
             .body("__type", equalTo("InvalidParameterValueException"))
-            .body("message", equalTo(textLogsMessage));
+            .body("message", equalTo(TEXT_LOGS_MESSAGE));
 
-        given()
-            .contentType("application/json")
-            .body("{\"LoggingConfig\": {\"LogGroup\": \"/custom/updated\"}}")
-        .when()
-            .put(BASE_PATH + "/functions/durable-partial-logs-fn/configuration")
-        .then()
+        updateConfiguration("durable-partial-logs-fn", "{\"LoggingConfig\": {\"LogGroup\": \"/custom/updated\"}}")
             .statusCode(200)
             .body("LoggingConfig.LogFormat", equalTo("JSON"))
             .body("LoggingConfig.LogGroup", equalTo("/custom/updated"));
@@ -162,60 +144,65 @@ class LambdaDurableConfigIntegrationTest {
 
     @Test
     void plainFunctionHasNoDurableConfig() {
-        given()
-            .contentType("application/json")
-            .body(functionJson("plain-no-durable-fn", ""))
-        .when()
-            .post(BASE_PATH + "/functions")
-        .then()
+        createFunction("plain-no-durable-fn", "")
             .statusCode(201)
             .body("$", not(hasKey("DurableConfig")))
             .body("Timeout", equalTo(3))
             .body("LoggingConfig.LogFormat", equalTo("Text"));
 
-        given()
-        .when()
-            .get(BASE_PATH + "/functions/plain-no-durable-fn/configuration")
-        .then()
+        getConfiguration("plain-no-durable-fn")
             .statusCode(200)
             .body("$", not(hasKey("DurableConfig")));
     }
 
     @Test
     void createWithoutExecutionTimeoutIsRejected() {
-        assertCreateFails("{\"RetentionPeriodInDays\": 7}", "InvalidParameterValueException",
-                "You cannot create a function with a durable configuration without an executionTimeout");
+        createDurableFunction("durable-invalid-fn", "{\"RetentionPeriodInDays\": 7}")
+            .statusCode(400)
+            .body("__type", equalTo("InvalidParameterValueException"))
+            .body("message", equalTo("You cannot create a function with a durable configuration "
+                    + "without an executionTimeout"));
     }
 
     @Test
     void membersOutOfRangeAreValidationErrors() {
-        assertCreateFails("{\"ExecutionTimeout\": 0}", "ValidationException",
-                "1 validation error detected: Value '0' at 'durableConfig.executionTimeout' failed to satisfy "
-                        + "constraint: Member must have value greater than or equal to 1");
-        assertCreateFails("{\"ExecutionTimeout\": 60, \"RetentionPeriodInDays\": 91}", "ValidationException",
-                "1 validation error detected: Value '91' at 'durableConfig.retentionPeriodInDays' failed to "
-                        + "satisfy constraint: Member must have value less than or equal to 90");
+        createDurableFunction("durable-invalid-fn", "{\"ExecutionTimeout\": 0}")
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("1 validation error detected: Value '0' at "
+                    + "'durableConfig.executionTimeout' failed to satisfy constraint: "
+                    + "Member must have value greater than or equal to 1"));
+
+        createDurableFunction("durable-invalid-fn", "{\"ExecutionTimeout\": 60, \"RetentionPeriodInDays\": 91}")
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("1 validation error detected: Value '91' at "
+                    + "'durableConfig.retentionPeriodInDays' failed to satisfy constraint: "
+                    + "Member must have value less than or equal to 90"));
     }
 
     @Test
     void nonIntegerMembersAreSerializationErrors() {
-        assertCreateFails("{\"ExecutionTimeout\": \"60\"}", "SerializationException",
-                "DurableConfig.ExecutionTimeout must be an integer");
+        createDurableFunction("durable-invalid-fn", "{\"ExecutionTimeout\": \"60\"}")
+            .statusCode(400)
+            .body("__type", equalTo("SerializationException"))
+            .body("message", equalTo("DurableConfig.ExecutionTimeout must be an integer"));
     }
 
     @Test
     void kmsKeyArnMustMatchThePattern() {
-        assertCreateFails("{\"ExecutionTimeout\": 60, \"KMSKeyArn\": \"not-an-arn\"}", "ValidationException",
-                "1 validation error detected: Value 'not-an-arn' at 'durableConfig.kMSKeyArn' failed to satisfy "
-                        + "constraint: Member must satisfy regular expression pattern: "
-                        + "(arn:(aws[a-zA-Z-]*)?:[a-z0-9-.]+:.*)|()");
+        createDurableFunction("durable-invalid-fn", "{\"ExecutionTimeout\": 60, \"KMSKeyArn\": \"not-an-arn\"}")
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("1 validation error detected: Value 'not-an-arn' at "
+                    + "'durableConfig.kMSKeyArn' failed to satisfy constraint: Member must satisfy regular "
+                    + "expression pattern: (arn:(aws[a-zA-Z-]*)?:[a-z0-9-.]+:.*)|()"));
     }
 
     @Test
     void updateMergesMembersAndAPublishedVersionKeepsItsSnapshot() {
-        createFunction("durable-update-fn", """
-            ,
-                "DurableConfig": {"ExecutionTimeout": 3600, "RetentionPeriodInDays": 7}""");
+        createDurableFunction("durable-update-fn", "{\"ExecutionTimeout\": 3600, \"RetentionPeriodInDays\": 7}")
+            .statusCode(201);
 
         given()
             .contentType("application/json")
@@ -244,10 +231,7 @@ class LambdaDurableConfigIntegrationTest {
             .body("DurableConfig.ExecutionTimeout", equalTo(7200))
             .body("DurableConfig.RetentionPeriodInDays", equalTo(3));
 
-        given()
-        .when()
-            .get(BASE_PATH + "/functions/durable-update-fn/configuration?Qualifier=1")
-        .then()
+        getConfiguration("durable-update-fn", "?Qualifier=1")
             .statusCode(200)
             .body("DurableConfig.ExecutionTimeout", equalTo(3600))
             .body("DurableConfig.RetentionPeriodInDays", equalTo(7))
@@ -256,7 +240,7 @@ class LambdaDurableConfigIntegrationTest {
 
     @Test
     void updateCannotAddDurableConfigToAPlainFunction() {
-        createFunction("plain-stays-plain-fn", "");
+        createFunction("plain-stays-plain-fn", "").statusCode(201);
 
         updateDurableConfig("plain-stays-plain-fn", "{\"ExecutionTimeout\": 60}")
             .statusCode(400)
@@ -264,32 +248,12 @@ class LambdaDurableConfigIntegrationTest {
             .body("message", equalTo("You cannot add a durable configuration to a function that was "
                     + "originally created with no durable configuration"));
 
-        given()
-        .when()
-            .get(BASE_PATH + "/functions/plain-stays-plain-fn/configuration")
-        .then()
+        getConfiguration("plain-stays-plain-fn")
             .statusCode(200)
             .body("$", not(hasKey("DurableConfig")));
     }
 
     private static ValidatableResponse updateDurableConfig(String name, String durableConfig) {
-        return given()
-            .contentType("application/json")
-            .body("{\"DurableConfig\": " + durableConfig + "}")
-        .when()
-            .put(BASE_PATH + "/functions/" + name + "/configuration")
-        .then();
-    }
-
-    private static void assertCreateFails(String durableConfig, String errorType, String message) {
-        given()
-            .contentType("application/json")
-            .body(functionJson("durable-invalid-fn", ",\n    \"DurableConfig\": " + durableConfig))
-        .when()
-            .post(BASE_PATH + "/functions")
-        .then()
-            .statusCode(400)
-            .body("__type", equalTo(errorType))
-            .body("message", equalTo(message));
+        return updateConfiguration(name, "{\"DurableConfig\": " + durableConfig + "}");
     }
 }

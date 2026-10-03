@@ -422,16 +422,12 @@ public class LambdaService implements ResourceProvider {
         String packageType = request.getOrDefault("PackageType", "Zip").toString();
         String description = (String) request.get("Description");
         DurableConfigRequest durable = durableConfigRequest(durableConfig);
-        if (durable != null && durable.executionTimeout() == null) {
-            throw new AwsException("InvalidParameterValueException",
-                    "You cannot create a function with a durable configuration without an executionTimeout", 400);
-        }
-        if (durable != null) {
-            validateDurableLogging(loggingConfig);
-        }
         int defaultTimeout = config != null ? config.services().lambda().defaultTimeoutSeconds() : 3;
         if (durable != null) {
-            // A durable function's Timeout defaults to its ExecutionTimeout, capped at the 15 minute limit.
+            if (durable.executionTimeout() == null) {
+                throw new AwsException("InvalidParameterValueException",
+                        "You cannot create a function with a durable configuration without an executionTimeout", 400);
+            }
             defaultTimeout = Math.min(durable.executionTimeout(), MAX_FUNCTION_TIMEOUT_SECONDS);
         }
         int timeout = toInt(request.get("Timeout"), defaultTimeout);
@@ -532,8 +528,8 @@ public class LambdaService implements ResourceProvider {
         }
 
         applySnapStart(fn, snapStart);
-        applyLoggingConfig(fn, loggingConfig);
         applyDurableConfig(fn, durable);
+        applyLoggingConfig(fn, loggingConfig);
 
         List<LambdaFileSystemConfig> fileSystemConfigs =
                 parseFileSystemConfigs(request.get("FileSystemConfigs"));
@@ -821,20 +817,14 @@ public class LambdaService implements ResourceProvider {
             validateSnapStart(snapStart);
         }
         if (request.containsKey("LoggingConfig")) {
-            validateLoggingConfig(loggingConfig);
-            if (fn.isDurable()) {
-                validateDurableLogging(loggingConfig);
-            }
+            validateLoggingConfig(loggingConfig, fn.isDurable());
         }
-        DurableConfigRequest durable = null;
-        if (durableConfig != null) {
-            if (!fn.isDurable()) {
-                throw new AwsException("InvalidParameterValueException",
-                        "You cannot add a durable configuration to a function that was originally created "
-                                + "with no durable configuration", 400);
-            }
-            durable = durableConfigRequest(durableConfig);
+        if (durableConfig != null && !fn.isDurable()) {
+            throw new AwsException("InvalidParameterValueException",
+                    "You cannot add a durable configuration to a function that was originally created "
+                            + "with no durable configuration", 400);
         }
+        DurableConfigRequest durable = durableConfigRequest(durableConfig);
         if (request.containsKey("Role")) {
             validateRoleArn((String) request.get("Role"));
         }
@@ -937,9 +927,6 @@ public class LambdaService implements ResourceProvider {
 
         if (request.containsKey("LoggingConfig")) {
             applyLoggingConfig(fn, loggingConfig);
-            if (fn.isDurable()) {
-                fn.setLogFormat("JSON");
-            }
         }
 
         if (durable != null) {
@@ -2516,38 +2503,22 @@ public class LambdaService implements ResourceProvider {
             throw new AwsException("SerializationException", "DurableConfig." + member + " must be an integer", 400);
         }
         long number = ((Number) value).longValue();
-        String field = "durableConfig." + Character.toLowerCase(member.charAt(0)) + member.substring(1);
-        if (number < 1) {
+        if (number < 1 || number > maximum) {
+            String field = "durableConfig." + Character.toLowerCase(member.charAt(0)) + member.substring(1);
+            String bound = number < 1 ? "greater than or equal to 1" : "less than or equal to " + maximum;
             throw new AwsException("ValidationException",
                     "1 validation error detected: Value '" + number + "' at '" + field + "' failed to satisfy "
-                            + "constraint: Member must have value greater than or equal to 1", 400);
-        }
-        if (number > maximum) {
-            throw new AwsException("ValidationException",
-                    "1 validation error detected: Value '" + number + "' at '" + field + "' failed to satisfy "
-                            + "constraint: Member must have value less than or equal to " + maximum, 400);
+                            + "constraint: Member must have value " + bound, 400);
         }
         return (int) number;
     }
 
-    /** A durable function logs in JSON format only; Text is rejected and an unset LogFormat means JSON. */
-    private static void validateDurableLogging(Map<String, Object> loggingConfig) {
-        if (loggingConfig != null && "Text".equals(loggingConfig.get("LogFormat"))) {
-            throw new AwsException("InvalidParameterValueException",
-                    "You cannot use plain text logs with a durable function. Only JSON format logs are supported",
-                    400);
-        }
-    }
-
-    /** CreateFunction: RetentionPeriodInDays defaults to 14 days and the log format is always JSON. */
     private static void applyDurableConfig(LambdaFunction fn, DurableConfigRequest durable) {
         if (durable == null) {
             return;
         }
-        fn.setDurableExecutionTimeout(durable.executionTimeout());
-        fn.setDurableRetentionPeriodInDays(durable.retentionPeriodInDays() != null
-                ? durable.retentionPeriodInDays() : DEFAULT_DURABLE_RETENTION_DAYS);
-        fn.setDurableKmsKeyArn(durable.kmsKeyArn() == null || durable.kmsKeyArn().isEmpty() ? null : durable.kmsKeyArn());
+        fn.setDurableRetentionPeriodInDays(DEFAULT_DURABLE_RETENTION_DAYS);
+        mergeDurableConfig(fn, durable);
         fn.setLogFormat("JSON");
     }
 
@@ -2564,9 +2535,14 @@ public class LambdaService implements ResourceProvider {
         }
     }
 
-    private static void validateLoggingConfig(Object value) {
+    private static void validateLoggingConfig(Object value, boolean durable) {
         if (!(value instanceof Map<?, ?> logging)) {
             return;
+        }
+        if (durable && "Text".equals(logging.get("LogFormat"))) {
+            throw new AwsException("InvalidParameterValueException",
+                    "You cannot use plain text logs with a durable function. Only JSON format logs are supported",
+                    400);
         }
         validateEnum(logging.get("LogFormat"), "loggingConfig.logFormat", List.of("JSON", "Text"));
         validateEnum(logging.get("ApplicationLogLevel"), "loggingConfig.applicationLogLevel",
@@ -2735,8 +2711,9 @@ public class LambdaService implements ResourceProvider {
         if (!(value instanceof Map<?, ?> logging)) {
             return;
         }
-        validateLoggingConfig(value);
-        String format = logging.get("LogFormat") instanceof String f && !f.isBlank() ? f : "Text";
+        validateLoggingConfig(value, fn.isDurable());
+        String defaultFormat = fn.isDurable() ? "JSON" : "Text";
+        String format = logging.get("LogFormat") instanceof String f && !f.isBlank() ? f : defaultFormat;
         boolean json = "JSON".equals(format);
         fn.setLogFormat(format);
         fn.setApplicationLogLevel(json && logging.get("ApplicationLogLevel") instanceof String level

@@ -15,6 +15,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.file.Path;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -63,15 +64,13 @@ class LambdaServicePersistenceTest {
 
         LambdaService reloaded = serviceWithStorage(store, storage);
         LambdaFunction fn = reloaded.getFunction(REGION, "durable-fn");
-        assertTrue(fn.isDurable());
-        assertEquals(3600, fn.getDurableExecutionTimeout());
-        assertEquals(14, fn.getDurableRetentionPeriodInDays());
-
         ObjectMapper mapper = new ObjectMapper();
         LambdaFunction copy = mapper.readValue(mapper.writeValueAsString(fn), LambdaFunction.class);
-        assertTrue(copy.isDurable());
-        assertEquals(3600, copy.getDurableExecutionTimeout());
-        assertEquals(14, copy.getDurableRetentionPeriodInDays());
+        for (LambdaFunction function : List.of(fn, copy)) {
+            assertTrue(function.isDurable());
+            assertEquals(3600, function.getDurableExecutionTimeout());
+            assertEquals(14, function.getDurableRetentionPeriodInDays());
+        }
     }
 
     @Test
