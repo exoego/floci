@@ -275,4 +275,75 @@ class LambdaFunctionConfigTest {
             } catch (Exception ignored) {}
         }
     }
+
+    @Test
+    @Order(7)
+    @DisplayName("DurableConfig round-trips via create, publish, update and get")
+    void durableConfigRoundTrips() {
+        String durableFn = TestFixtures.uniqueName("fn-durable");
+        try {
+            CreateFunctionResponse createResp = lambda.createFunction(CreateFunctionRequest.builder()
+                    .functionName(durableFn)
+                    .runtime(Runtime.NODEJS20_X)
+                    .role(ROLE)
+                    .handler("index.handler")
+                    .code(FunctionCode.builder()
+                            .zipFile(SdkBytes.fromByteArray(LambdaUtils.minimalZip()))
+                            .build())
+                    .durableConfig(DurableConfig.builder().executionTimeout(3600).build())
+                    .build());
+
+            assertThat(createResp.durableConfig().executionTimeout()).isEqualTo(3600);
+            assertThat(createResp.durableConfig().retentionPeriodInDays())
+                    .as("RetentionPeriodInDays defaults to 14")
+                    .isEqualTo(14);
+            assertThat(createResp.timeout())
+                    .as("Timeout of a durable function defaults to the 15 minute cap")
+                    .isEqualTo(900);
+
+            PublishVersionResponse published = lambda.publishVersion(
+                    PublishVersionRequest.builder().functionName(durableFn).build());
+            assertThat(published.durableConfig().retentionPeriodInDays()).isEqualTo(14);
+
+            UpdateFunctionConfigurationResponse updateResp = lambda.updateFunctionConfiguration(
+                    UpdateFunctionConfigurationRequest.builder()
+                            .functionName(durableFn)
+                            .durableConfig(DurableConfig.builder().retentionPeriodInDays(7).build())
+                            .build());
+            assertThat(updateResp.durableConfig().executionTimeout())
+                    .as("a member left out of the update keeps its value")
+                    .isEqualTo(3600);
+            assertThat(updateResp.durableConfig().retentionPeriodInDays()).isEqualTo(7);
+
+            GetFunctionConfigurationResponse version1 = lambda.getFunctionConfiguration(
+                    GetFunctionConfigurationRequest.builder()
+                            .functionName(durableFn)
+                            .qualifier(published.version())
+                            .build());
+            assertThat(version1.durableConfig().retentionPeriodInDays())
+                    .as("a published version keeps the DurableConfig it was published with")
+                    .isEqualTo(14);
+
+            GetFunctionResponse getResp = lambda.getFunction(
+                    GetFunctionRequest.builder().functionName(durableFn).build());
+            assertThat(getResp.configuration().durableConfig().retentionPeriodInDays()).isEqualTo(7);
+
+            GetFunctionConfigurationResponse plain = lambda.getFunctionConfiguration(
+                    GetFunctionConfigurationRequest.builder().functionName(FN).build());
+            assertThat(plain.durableConfig())
+                    .as("a function created without DurableConfig has none")
+                    .isNull();
+            assertThatThrownBy(() -> lambda.updateFunctionConfiguration(
+                    UpdateFunctionConfigurationRequest.builder()
+                            .functionName(FN)
+                            .durableConfig(DurableConfig.builder().executionTimeout(60).build())
+                            .build()))
+                    .as("DurableConfig cannot be added to a function created without one")
+                    .isInstanceOf(InvalidParameterValueException.class);
+        } finally {
+            try {
+                lambda.deleteFunction(DeleteFunctionRequest.builder().functionName(durableFn).build());
+            } catch (Exception ignored) {}
+        }
+    }
 }

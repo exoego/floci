@@ -89,6 +89,13 @@ public class LambdaService implements ResourceProvider {
     private static final int MAX_TAG_KEY_LENGTH = 128;
     private static final Pattern KMS_KEY_ARN_PATTERN = Pattern.compile(
             "^(arn:(aws[a-zA-Z-]*)?:[a-z0-9-.]+:.*)?$");
+    /** The DurableConfig member has its own pattern text, which AWS prints in the validation message. */
+    private static final Pattern DURABLE_KMS_KEY_ARN_PATTERN = Pattern.compile(
+            "(arn:(aws[a-zA-Z-]*)?:[a-z0-9-.]+:.*)|()");
+    private static final int MAX_DURABLE_EXECUTION_TIMEOUT_SECONDS = 31622400;
+    private static final int MAX_DURABLE_RETENTION_DAYS = 90;
+    private static final int DEFAULT_DURABLE_RETENTION_DAYS = 14;
+    private static final int MAX_FUNCTION_TIMEOUT_SECONDS = 900;
     private static final Pattern LAYER_VERSION_ARN_PATTERN = Pattern.compile(
             "^((arn:(aws[a-zA-Z-]*)?:lambda:(eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:\\d{12}:layer:[a-zA-Z0-9-_]+:[0-9]+)"
                     + "|(arn:[a-zA-Z0-9-]+:lambda:::awslayer:[a-zA-Z0-9-_]+))$");
@@ -124,7 +131,7 @@ public class LambdaService implements ResourceProvider {
      */
     private static final List<String> CONFIG_STRUCTURE_MEMBERS = List.of(
             "Environment", "EphemeralStorage", "TracingConfig", "DeadLetterConfig",
-            "VpcConfig", "SnapStart", "LoggingConfig", "ImageConfig");
+            "VpcConfig", "SnapStart", "LoggingConfig", "ImageConfig", "DurableConfig");
 
     private final LambdaFunctionStore functionStore;
     private final LambdaExecutorService executorService;
@@ -404,6 +411,7 @@ public class LambdaService implements ResourceProvider {
         Map<String, Object> snapStart = structureMember(request, "SnapStart");
         Map<String, Object> loggingConfig = structureMember(request, "LoggingConfig");
         Map<String, Object> imageConfig = structureMember(request, "ImageConfig");
+        Map<String, Object> durableConfig = structureMember(request, "DurableConfig");
         Map<String, Object> code = structureMember(request, "Code");
 
         String functionName = (String) request.get("FunctionName");
@@ -413,7 +421,17 @@ public class LambdaService implements ResourceProvider {
         validateEnum(request.get("PackageType"), "packageType", List.of("Zip", "Image"));
         String packageType = request.getOrDefault("PackageType", "Zip").toString();
         String description = (String) request.get("Description");
-        int timeout = toInt(request.get("Timeout"), config != null ? config.services().lambda().defaultTimeoutSeconds() : 3);
+        DurableConfigRequest durable = durableConfigRequest(durableConfig);
+        if (durable != null && durable.executionTimeout() == null) {
+            throw new AwsException("InvalidParameterValueException",
+                    "You cannot create a function with a durable configuration without an executionTimeout", 400);
+        }
+        int defaultTimeout = config != null ? config.services().lambda().defaultTimeoutSeconds() : 3;
+        if (durable != null) {
+            // A durable function's Timeout defaults to its ExecutionTimeout, capped at the 15 minute limit.
+            defaultTimeout = Math.min(durable.executionTimeout(), MAX_FUNCTION_TIMEOUT_SECONDS);
+        }
+        int timeout = toInt(request.get("Timeout"), defaultTimeout);
         int memorySize = toInt(request.get("MemorySize"), config != null ? config.services().lambda().defaultMemoryMb() : 128);
 
         if (functionName == null || functionName.isBlank()) {
@@ -512,6 +530,7 @@ public class LambdaService implements ResourceProvider {
 
         applySnapStart(fn, snapStart);
         applyLoggingConfig(fn, loggingConfig);
+        applyDurableConfig(fn, durable, loggingConfig == null);
 
         List<LambdaFileSystemConfig> fileSystemConfigs =
                 parseFileSystemConfigs(request.get("FileSystemConfigs"));
@@ -772,6 +791,7 @@ public class LambdaService implements ResourceProvider {
         Map<String, Object> snapStart = structureMember(request, "SnapStart");
         Map<String, Object> loggingConfig = structureMember(request, "LoggingConfig");
         Map<String, Object> imageConfig = structureMember(request, "ImageConfig");
+        Map<String, Object> durableConfig = structureMember(request, "DurableConfig");
 
         // Validated before any field mutation below, not inline where Layers is applied further
         // down - fn is the live object backing this store entry (InMemoryStorage#get returns the
@@ -799,6 +819,15 @@ public class LambdaService implements ResourceProvider {
         }
         if (request.containsKey("LoggingConfig")) {
             validateLoggingConfig(loggingConfig);
+        }
+        DurableConfigRequest durable = null;
+        if (durableConfig != null) {
+            if (!fn.isDurable()) {
+                throw new AwsException("InvalidParameterValueException",
+                        "You cannot add a durable configuration to a function that was originally created "
+                                + "with no durable configuration", 400);
+            }
+            durable = durableConfigRequest(durableConfig);
         }
         if (request.containsKey("Role")) {
             validateRoleArn((String) request.get("Role"));
@@ -902,6 +931,10 @@ public class LambdaService implements ResourceProvider {
 
         if (request.containsKey("LoggingConfig")) {
             applyLoggingConfig(fn, loggingConfig);
+        }
+
+        if (durable != null) {
+            mergeDurableConfig(fn, durable);
         }
 
         if (request.containsKey("FileSystemConfigs")) {
@@ -2249,6 +2282,9 @@ public class LambdaService implements ResourceProvider {
             snapshot.setTracingMode(fn.getTracingMode());
             snapshot.setDeadLetterTargetArn(fn.getDeadLetterTargetArn());
             snapshot.setKmsKeyArn(fn.getKmsKeyArn());
+            snapshot.setDurableExecutionTimeout(fn.getDurableExecutionTimeout());
+            snapshot.setDurableRetentionPeriodInDays(fn.getDurableRetentionPeriodInDays());
+            snapshot.setDurableKmsKeyArn(fn.getDurableKmsKeyArn());
 
             functionStore.save(region, snapshot);
             LOG.infov("Published version {0} for function {1}", version, functionName);
@@ -2441,6 +2477,78 @@ public class LambdaService implements ResourceProvider {
         validateSnapStart(value);
         Object applyOn = snapStart.get("ApplyOn");
         fn.setSnapStartApplyOn(applyOn instanceof String s && !s.isBlank() ? s : "None");
+    }
+
+    /** The members of a request's DurableConfig after type, range and pattern validation; each may be absent. */
+    private record DurableConfigRequest(Integer executionTimeout, Integer retentionPeriodInDays, String kmsKeyArn) {
+    }
+
+    private static DurableConfigRequest durableConfigRequest(Map<String, Object> durableConfig) {
+        if (durableConfig == null) {
+            return null;
+        }
+        Integer executionTimeout = durableConfigInteger(durableConfig.get("ExecutionTimeout"),
+                "ExecutionTimeout", MAX_DURABLE_EXECUTION_TIMEOUT_SECONDS);
+        Integer retentionPeriodInDays = durableConfigInteger(durableConfig.get("RetentionPeriodInDays"),
+                "RetentionPeriodInDays", MAX_DURABLE_RETENTION_DAYS);
+        Object kmsKeyArn = durableConfig.get("KMSKeyArn");
+        if (kmsKeyArn != null && !(kmsKeyArn instanceof String)) {
+            throw new AwsException("SerializationException", "DurableConfig.KMSKeyArn must be a string", 400);
+        }
+        validatePattern(kmsKeyArn, "durableConfig.kMSKeyArn", DURABLE_KMS_KEY_ARN_PATTERN);
+        return new DurableConfigRequest(executionTimeout, retentionPeriodInDays, (String) kmsKeyArn);
+    }
+
+    private static Integer durableConfigInteger(Object value, String member, int maximum) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Byte || value instanceof Short || value instanceof Integer || value instanceof Long)) {
+            throw new AwsException("SerializationException", "DurableConfig." + member + " must be an integer", 400);
+        }
+        long number = ((Number) value).longValue();
+        String field = "durableConfig." + Character.toLowerCase(member.charAt(0)) + member.substring(1);
+        if (number < 1) {
+            throw new AwsException("ValidationException",
+                    "1 validation error detected: Value '" + number + "' at '" + field + "' failed to satisfy "
+                            + "constraint: Member must have value greater than or equal to 1", 400);
+        }
+        if (number > maximum) {
+            throw new AwsException("ValidationException",
+                    "1 validation error detected: Value '" + number + "' at '" + field + "' failed to satisfy "
+                            + "constraint: Member must have value less than or equal to " + maximum, 400);
+        }
+        return (int) number;
+    }
+
+    /**
+     * CreateFunction: RetentionPeriodInDays defaults to 14 days, and a durable function created without a
+     * LoggingConfig logs in JSON format, where a plain function logs as Text.
+     */
+    private static void applyDurableConfig(LambdaFunction fn, DurableConfigRequest durable, boolean defaultLogging) {
+        if (durable == null) {
+            return;
+        }
+        fn.setDurableExecutionTimeout(durable.executionTimeout());
+        fn.setDurableRetentionPeriodInDays(durable.retentionPeriodInDays() != null
+                ? durable.retentionPeriodInDays() : DEFAULT_DURABLE_RETENTION_DAYS);
+        fn.setDurableKmsKeyArn(durable.kmsKeyArn() == null || durable.kmsKeyArn().isEmpty() ? null : durable.kmsKeyArn());
+        if (defaultLogging) {
+            fn.setLogFormat("JSON");
+        }
+    }
+
+    /** UpdateFunctionConfiguration merges DurableConfig per member; a member left out keeps its stored value. */
+    private static void mergeDurableConfig(LambdaFunction fn, DurableConfigRequest durable) {
+        if (durable.executionTimeout() != null) {
+            fn.setDurableExecutionTimeout(durable.executionTimeout());
+        }
+        if (durable.retentionPeriodInDays() != null) {
+            fn.setDurableRetentionPeriodInDays(durable.retentionPeriodInDays());
+        }
+        if (durable.kmsKeyArn() != null) {
+            fn.setDurableKmsKeyArn(durable.kmsKeyArn().isEmpty() ? null : durable.kmsKeyArn());
+        }
     }
 
     private static void validateLoggingConfig(Object value) {
