@@ -432,14 +432,6 @@ Floci-side rules:
   try-with-resources. The one exception is a record deconstruction pattern
   (`case Node(var left, var right) ->`), where naming the component types is pure
   noise.
-- **Import the classes you use. Do not write fully-qualified names inline.**
-  `new ArrayList<>()`, never `new java.util.ArrayList<>()`. The only reason to
-  qualify inline is a genuine name collision inside one file: import the type used
-  more often, qualify the other, and leave a short comment naming the clash.
-  Real examples in this repo are `apigateway` versus `apigatewayv2` model types,
-  CDI `jakarta.enterprise.inject.Instance` versus the EC2 model `Instance`,
-  `jakarta.inject.Provider` versus `jakarta.ws.rs.ext.Provider`, and a service's
-  own `Record` model versus `java.lang.Record`.
 
 ### Imports
 
