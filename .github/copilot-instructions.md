@@ -26,6 +26,9 @@ Raise concerns when a PR introduces any of the following without strong justific
 - `var` where an explicit type belongs. Floci reproduces AWS wire contracts, so the
   concrete type at a call site is usually what a reviewer needs to see. The one
   exception is a record deconstruction pattern.
+- Fully-qualified class names written inline instead of imported, such as
+  `new java.util.ArrayList<>()`. A genuine name clash inside one file is fine.
+  Checkstyle catches this except in the files it still suppresses.
 - Wildcard imports in `src/main`. Static wildcards in tests are fine.
 - An empty `catch` block. A tolerated exception is logged, or named `ignored` or
   `expected` with a comment saying why swallowing is safe.
@@ -129,7 +132,8 @@ When analyzing a PR, check:
 - Are tests added or updated where compatibility is affected?
 - Are docs updated when user-facing behavior changes?
 - Does new code follow the AGENTS.md Code Style rules: explicit types over `var`,
-  no wildcard imports in `src/main`, braces in conditionals, constructor injection?
+  imported classes over inline fully-qualified names, no wildcard imports in
+  `src/main`, braces in conditionals, constructor injection?
 
 ## How to Write Feedback
 

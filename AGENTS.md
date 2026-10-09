@@ -432,6 +432,11 @@ Floci-side rules:
   try-with-resources. The one exception is a record deconstruction pattern
   (`case Node(var left, var right) ->`), where naming the component types is pure
   noise.
+- **Import the classes you use. Do not write fully-qualified names inline.**
+  `new ArrayList<>()`, never `new java.util.ArrayList<>()`. Qualify inline only for
+  a genuine name clash inside one file: import the type used more often, qualify the
+  other, and leave a short comment naming the clash. Checkstyle (`NoFqcn`) enforces
+  this except in the files listed in `tools/checkstyle/suppressions.xml`.
 
 ### Imports
 
