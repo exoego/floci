@@ -556,6 +556,26 @@ class DynamoDbPartiQLIntegrationTest {
                     equalTo("Statement wasn't well formed, can't be processed: Unexpected token after expression"));
     }
 
+    @Test
+    @Order(27)
+    void aStatementThatIsOneTermIsRefusedByItsKind() {
+        statement("x IS INT4")
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("Unsupported operation: IsType"));
+        request("DynamoDB_20120810.ExecuteTransaction", """
+                {"TransactStatements":[{"Statement":"?"}]}
+                """)
+            .statusCode(400)
+            .body("message", equalTo("Validation failed in TransactStatements[0]: Unsupported operation: Parameter"));
+        request("DynamoDB_20120810.BatchExecuteStatement", """
+                {"Statements":[{"Statement":"x.y IS DOUBLE PRECISION"}]}
+                """)
+            .statusCode(200)
+            .body("Responses[0].Error.Code", equalTo("ValidationError"))
+            .body("Responses[0].Error.Message", equalTo("Unsupported operation: IsType"));
+    }
+
     private static void putItem(String pk, String attributes) {
         request("DynamoDB_20120810.PutItem", """
                 {"TableName":"%s","Item":{"pk":{"S":"%s"},%s}}

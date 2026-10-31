@@ -527,9 +527,98 @@ public class DynamoDbPartiQLParser {
             case DELETE -> parseDelete();
             default -> {
                 requireTermStart();
-                throw validationEx(NOT_WELL_FORMED + "Expected data manipulation");
+                throw validationEx(expressionStatementRefusal());
             }
         };
+    }
+
+    // DynamoDB reads any other statement as one expression and refuses it by the kind of that expression.
+    private String expressionStatementRefusal() {
+        String kind = parseTermKind();
+        if (kind == null || continuesExpression(peek())) {
+            return NOT_WELL_FORMED + "Expected data manipulation";
+        }
+        if (peek().type() == TType.SEMICOLON) {
+            advance();
+        }
+        return peek().type() == TType.EOF ? "Unsupported operation: " + kind : UNEXPECTED_TOKEN;
+    }
+
+    private String parseTermKind() {
+        int open = 0;
+        while (peek().type() == TType.LPAREN) {
+            advance();
+            open++;
+        }
+        String kind = parsePrimaryKind();
+        while (kind != null) {
+            if (peek().type() == TType.IS) {
+                advance();
+                boolean negated = peek().type() == TType.NOT;
+                if (negated) {
+                    advance();
+                }
+                parseTypeName(negated);
+                kind = negated ? null : "IsType";
+            } else if (0 < open && peek().type() == TType.RPAREN) {
+                advance();
+                open--;
+            } else {
+                break;
+            }
+        }
+        return open == 0 ? kind : null;
+    }
+
+    private String parsePrimaryKind() {
+        Token t = peek();
+        return switch (t.type()) {
+            case QUESTION -> {
+                advance();
+                yield "Parameter";
+            }
+            case MISSING -> {
+                advance();
+                yield "Missing";
+            }
+            case STRING, NUMBER, BOOL, NULL -> {
+                advance();
+                yield "Lit";
+            }
+            case PLUS, MINUS -> {
+                if (tokens.get(pos + 1).type() != TType.NUMBER) {
+                    yield null;
+                }
+                advance();
+                advance();
+                yield "Lit";
+            }
+            case LBRACKET, LBRACE, LBAG -> {
+                parseValue();
+                yield switch (t.type()) {
+                    case LBRACKET -> "List";
+                    case LBRACE -> "Struct";
+                    default -> "Bag";
+                };
+            }
+            case IDENT -> {
+                if (isBareWord(t) && KEYWORDS.contains(t.value().toLowerCase(Locale.ROOT))
+                        || tokens.get(pos + 1).type() == TType.LPAREN) {
+                    yield null;
+                }
+                yield parsePath().segments().size() == 1 ? "Id" : "Path";
+            }
+            default -> null;
+        };
+    }
+
+    private static final Set<TType> EXPRESSION_CONTINUATIONS = EnumSet.of(TType.EQ, TType.NE, TType.LT, TType.LE,
+            TType.GT, TType.GE, TType.AND, TType.OR, TType.NOT, TType.IN, TType.BETWEEN, TType.PLUS, TType.MINUS,
+            TType.LPAREN, TType.LBRACKET, TType.DOT);
+
+    private boolean continuesExpression(Token t) {
+        return EXPRESSION_CONTINUATIONS.contains(t.type()) || isStar(t)
+                || Stream.of("LIKE", "UNION", "INTERSECT", "EXCEPT").anyMatch(word -> isWord(t, word));
     }
 
     // SELECT col [, col …] | * FROM "Table"["." "Index"] [WHERE cond [AND cond …]]
