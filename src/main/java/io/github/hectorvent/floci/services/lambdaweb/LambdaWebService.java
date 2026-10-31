@@ -236,11 +236,7 @@ public class LambdaWebService implements Resettable {
                     originHosts.remove(originHost(host), host);
                     return Optional.empty();
                 }
-                WebFunction live = stored.get();
-                failLostCode(locator.region(), live, live.endpoints.get(locator.endpointName()).revisionWeights.stream()
-                        .map(weight -> live.revisions.get(weight.revisionId))
-                        .toList());
-                WebFunction fn = copy(live, WebFunction.class);
+                WebFunction fn = copy(stored.get(), WebFunction.class);
                 return Optional.of(new WebFunctionTarget(locator.accountId(), locator.region(), fn,
                         fn.endpoints.get(locator.endpointName()), locator.servingRegion()));
             }
@@ -253,6 +249,25 @@ public class LambdaWebService implements Resettable {
      */
     public Optional<String> endpointDomain(String host) {
         return Optional.ofNullable(originHosts.get(host));
+    }
+
+    /**
+     * Whether a request routed to {@code revisionId} may run. It can fail and store the revision, so it is called off
+     * the event loop.
+     */
+    public boolean isRevisionActive(WebFunctionTarget target, String revisionId) {
+        String functionName = target.function().functionName;
+        return RequestScopes.callAs(target.accountId(), target.region(), () -> {
+            synchronized (lockFor(target.region(), functionName)) {
+                WebFunction fn = functions.get(key(target.region(), functionName)).orElse(null);
+                WebFunctionRevision revision = fn == null ? null : fn.revisions.get(revisionId);
+                if (revision == null) {
+                    return true;
+                }
+                failLostCode(target.region(), fn, List.of(revision));
+                return revision.failureReason == null;
+            }
+        });
     }
 
     /**
@@ -780,23 +795,20 @@ public class LambdaWebService implements Resettable {
 
     /**
      * AWS moves a revision to Failed for good once it finds its object version gone or closed to Lambda, at a time it
-     * does not document. Floci looks each time a revision's state is read or a request is routed to it.
+     * does not document. Floci looks each time a revision's state is read or a request is routed to it. The copy of
+     * the code stays until the revision is deleted, as an environment may be starting from it.
      */
     private void failLostCode(String region, WebFunction fn, Collection<WebFunctionRevision> revisions) {
         if (s3Service == null) {
             return;
         }
-        String accountId = AwsArnUtils.parse(fn.functionArn).accountId();
         boolean failed = false;
         for (WebFunctionRevision revision : revisions) {
             if (revision.failureReason != null || revision.codeVersionId == null) {
                 continue;
             }
             revision.failureReason = lostCodeReason(fn, revision);
-            if (revision.failureReason != null) {
-                code.deleteRevision(accountId, region, fn.functionName, revision.revisionId);
-                failed = true;
-            }
+            failed |= revision.failureReason != null;
         }
         if (failed) {
             persist(region, fn);

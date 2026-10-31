@@ -221,12 +221,6 @@ public class LambdaWebDataPlane {
             page(request, LambdaWebErrorPages.ORIGIN_REQUEST_ERROR, requestId, false);
             return;
         }
-        if (revision.failureReason != null) {
-            request.resume();
-            metrics.answered(target, LambdaWebErrorPages.REVISION_NOT_ACTIVE.status());
-            page(request, LambdaWebErrorPages.REVISION_NOT_ACTIVE, requestId, false);
-            return;
-        }
         if ("100-continue".equalsIgnoreCase(request.getHeader("Expect"))) {
             request.response().writeContinue();
         }
@@ -248,6 +242,9 @@ public class LambdaWebDataPlane {
         vertx.<Environment>executeBlocking(() -> {
             if (dead != null) {
                 environments.discard(dead);
+            }
+            if (!service.isRevisionActive(target, revision.revisionId)) {
+                throw new StartFailure(LambdaWebErrorPages.REVISION_NOT_ACTIVE);
             }
             Integer maxEnvironments = target.endpoint().scalingConfig == null
                     ? null : target.endpoint().scalingConfig.maxEnvironments;
