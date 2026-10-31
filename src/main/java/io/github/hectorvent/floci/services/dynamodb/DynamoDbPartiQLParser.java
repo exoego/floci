@@ -541,33 +541,72 @@ public class DynamoDbPartiQLParser {
         if (peek().type() == TType.SEMICOLON) {
             advance();
         }
-        return peek().type() == TType.EOF ? "Unsupported operation: " + kind : UNEXPECTED_TOKEN;
+        if (peek().type() != TType.EOF) {
+            return UNEXPECTED_TOKEN;
+        }
+        return OPERATOR.equals(kind) ? NOT_WELL_FORMED + "Expected data manipulation" : "Unsupported operation: " + kind;
     }
 
+    // A sign on anything but a number, or IS NOT. DynamoDB refuses it with a message of its own.
+    private static final String OPERATOR = "Operator";
+
+    // A sign folds into the number it applies to. It binds tighter than IS and looser than a path step.
     private String parseTermKind() {
-        int open = 0;
+        Deque<Boolean> signedGroups = new ArrayDeque<>();
+        boolean signed = skipSigns();
         while (peek().type() == TType.LPAREN) {
             advance();
-            open++;
+            requireTermStart();
+            signedGroups.push(signed);
+            signed = skipSigns();
         }
+        Token primary = peek();
         String kind = parsePrimaryKind();
-        while (kind != null) {
-            if (peek().type() == TType.IS) {
+        if (kind == null) {
+            return null;
+        }
+        boolean number = primary.type() == TType.NUMBER;
+        signed |= number && primary.value().startsWith("-");
+        while (true) {
+            if (addPathSteps(new ArrayList<>())) {
+                kind = "Path";
+                number = false;
+            }
+            if (signed) {
+                kind = number ? "Lit" : OPERATOR;
+            }
+            while (peek().type() == TType.IS) {
                 advance();
                 boolean negated = peek().type() == TType.NOT;
                 if (negated) {
                     advance();
                 }
                 parseTypeName(negated);
-                kind = negated ? null : "IsType";
-            } else if (0 < open && peek().type() == TType.RPAREN) {
-                advance();
-                open--;
-            } else {
+                kind = negated ? OPERATOR : "IsType";
+                number = false;
+            }
+            if (signedGroups.isEmpty() || peek().type() != TType.RPAREN) {
                 break;
             }
+            advance();
+            signed = signedGroups.pop();
         }
-        return open == 0 ? kind : null;
+        if (signedGroups.isEmpty()) {
+            return kind;
+        }
+        if (continuesExpression(peek())) {
+            return null;
+        }
+        throw validationEx(NOT_WELL_FORMED + "Expected RIGHT_PAREN");
+    }
+
+    private boolean skipSigns() {
+        boolean signed = false;
+        while (peek().type() == TType.PLUS || peek().type() == TType.MINUS) {
+            advance();
+            signed = true;
+        }
+        return signed;
     }
 
     private String parsePrimaryKind() {
@@ -582,14 +621,6 @@ public class DynamoDbPartiQLParser {
                 yield "Missing";
             }
             case STRING, NUMBER, BOOL, NULL -> {
-                advance();
-                yield "Lit";
-            }
-            case PLUS, MINUS -> {
-                if (tokens.get(pos + 1).type() != TType.NUMBER) {
-                    yield null;
-                }
-                advance();
                 advance();
                 yield "Lit";
             }
@@ -613,8 +644,7 @@ public class DynamoDbPartiQLParser {
     }
 
     private static final Set<TType> EXPRESSION_CONTINUATIONS = EnumSet.of(TType.EQ, TType.NE, TType.LT, TType.LE,
-            TType.GT, TType.GE, TType.AND, TType.OR, TType.NOT, TType.IN, TType.BETWEEN, TType.PLUS, TType.MINUS,
-            TType.LPAREN, TType.LBRACKET, TType.DOT);
+            TType.GT, TType.GE, TType.AND, TType.OR, TType.NOT, TType.IN, TType.BETWEEN, TType.PLUS, TType.MINUS);
 
     private boolean continuesExpression(Token t) {
         return EXPRESSION_CONTINUATIONS.contains(t.type()) || isStar(t)
@@ -1416,6 +1446,12 @@ public class DynamoDbPartiQLParser {
         requireTermStart();
         List<Seg> segments = new ArrayList<>();
         segments.add(new Seg.Name(expectIdent()));
+        addPathSteps(segments);
+        return new Path(List.copyOf(segments));
+    }
+
+    private boolean addPathSteps(List<Seg> segments) {
+        int start = segments.size();
         while (true) {
             switch (peek().type()) {
                 case DOT -> {
@@ -1428,7 +1464,7 @@ public class DynamoDbPartiQLParser {
                     consume(TType.RBRACKET);
                 }
                 default -> {
-                    return new Path(List.copyOf(segments));
+                    return start < segments.size();
                 }
             }
         }

@@ -561,7 +561,15 @@ class DynamoDbPartiQLParserTest {
             "size"                                  | Unsupported operation: Id
             begins_with                             | Unsupported operation: Id
             x.y[0]                                  | Unsupported operation: Path
+            (x).y                                   | Unsupported operation: Path
+            'a'[0]                                  | Unsupported operation: Path
+            ?.x                                     | Unsupported operation: Path
+            <<1>>[0]                                | Unsupported operation: Path
+            (-1).x                                  | Unsupported operation: Path
+            (x IS NOT NULL).y                       | Unsupported operation: Path
             - 1                                     | Unsupported operation: Lit
+            - + 1                                   | Unsupported operation: Lit
+            -((1))                                  | Unsupported operation: Lit
             1e126                                   | Unsupported operation: Lit
             NULL                                    | Unsupported operation: Lit
             MISSING                                 | Unsupported operation: Missing
@@ -569,11 +577,23 @@ class DynamoDbPartiQLParserTest {
             [1e126]                                 | Unsupported operation: List
             {}                                      | Unsupported operation: Struct
             <<1, 1>>                                | Unsupported operation: Bag
+            x IS NOT NULL IS NULL                   | Unsupported operation: IsType
+            -x IS NULL                              | Unsupported operation: IsType
+            -(1) IS NULL                            | Unsupported operation: IsType
+            (x).y IS NULL                           | Unsupported operation: IsType
             x IS FOO                                | NWF Expected type name
             x IS NOT                                | NWF Expected type name
             x IS INT4(1)                            | NWF is type argument integer4 must have arity of 0..0
             x IS INT4 y                             | NWF Unexpected token after expression
             x AS y                                  | NWF Unexpected token after expression
+            x IS NOT NULL y                         | NWF Unexpected token after expression
+            -x y                                    | NWF Unexpected token after expression
+            x IS NULL.y                             | NWF Unexpected token after expression
+            (x) (1)                                 | NWF Unexpected token after expression
+            ()                                      | NWF Unexpected term
+            (WHERE                                  | NWF Unexpected keyword
+            ((x)                                    | NWF Expected RIGHT_PAREN
+            (x IS NOT NULL                          | NWF Expected RIGHT_PAREN
             SLECT * FROM "t" WHERE pk = 'a'         | NWF Expected data manipulation
             """)
     void refusesAStatementThatIsOneTermByItsKind(String statement, String message) {
