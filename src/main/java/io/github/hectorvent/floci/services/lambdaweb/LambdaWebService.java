@@ -42,6 +42,7 @@ import java.net.URI;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Comparator;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -235,7 +236,11 @@ public class LambdaWebService implements Resettable {
                     originHosts.remove(originHost(host), host);
                     return Optional.empty();
                 }
-                WebFunction fn = copy(stored.get(), WebFunction.class);
+                WebFunction live = stored.get();
+                failLostCode(locator.region(), live, live.endpoints.get(locator.endpointName()).revisionWeights.stream()
+                        .map(weight -> live.revisions.get(weight.revisionId))
+                        .toList());
+                WebFunction fn = copy(live, WebFunction.class);
                 return Optional.of(new WebFunctionTarget(locator.accountId(), locator.region(), fn,
                         fn.endpoints.get(locator.endpointName()), locator.servingRegion()));
             }
@@ -507,7 +512,10 @@ public class LambdaWebService implements Resettable {
         String functionName = resolveFunctionName(region, functionNameOrArn, "GetWebFunctionRevision");
         String revisionId = resolveRevisionId(region, revisionIdOrArn, "GetWebFunctionRevision");
         synchronized (lockFor(region, functionName)) {
-            return copy(revision(function(region, functionName), revisionId), WebFunctionRevision.class);
+            WebFunction fn = function(region, functionName);
+            WebFunctionRevision revision = revision(fn, revisionId);
+            failLostCode(region, fn, List.of(revision));
+            return copy(revision, WebFunctionRevision.class);
         }
     }
 
@@ -517,6 +525,7 @@ public class LambdaWebService implements Resettable {
         String functionName = resolveFunctionName(region, functionNameOrArn, "ListWebFunctionRevisions");
         synchronized (lockFor(region, functionName)) {
             WebFunction fn = function(region, functionName);
+            failLostCode(region, fn, fn.revisions.values());
             List<WebFunctionRevision> snapshots = fn.revisions.values().stream()
                     .filter(r -> list.matchesState(r.failureReason == null ? "Active" : "Failed"))
                     .map(r -> copy(r, WebFunctionRevision.class))
@@ -745,8 +754,9 @@ public class LambdaWebService implements Resettable {
                 throw new AwsException("ValidationException", "Zipped size must be smaller than "
                         + LambdaWebCode.MAX_BYTES + " bytes", 400);
             }
-            requireLambdaCanRead(fn, revision,
-                    build.versionId != null ? build.versionId : object.object().getVersionId());
+            String versionId = build.versionId != null ? build.versionId : object.object().getVersionId();
+            requireLambdaCanRead(fn, revision, versionId);
+            revision.codeVersionId = versionId;
             size = code.store(accountId, region, fn.functionName, revision.revisionId, object.body());
         } catch (IOException e) {
             throw new UncheckedIOException("Could not close the code object s3://" + build.bucket + "/" + build.key, e);
@@ -768,20 +778,71 @@ public class LambdaWebService implements Resettable {
         }
     }
 
-    /** AWS evaluates only s3:GetObjectVersion, although its message names both actions. */
+    /**
+     * AWS moves a revision to Failed for good once it finds its object version gone or closed to Lambda, at a time it
+     * does not document. Floci looks each time a revision's state is read or a request is routed to it.
+     */
+    private void failLostCode(String region, WebFunction fn, Collection<WebFunctionRevision> revisions) {
+        if (s3Service == null) {
+            return;
+        }
+        String accountId = AwsArnUtils.parse(fn.functionArn).accountId();
+        boolean failed = false;
+        for (WebFunctionRevision revision : revisions) {
+            if (revision.failureReason != null || revision.codeVersionId == null) {
+                continue;
+            }
+            revision.failureReason = lostCodeReason(fn, revision);
+            if (revision.failureReason != null) {
+                code.deleteRevision(accountId, region, fn.functionName, revision.revisionId);
+                failed = true;
+            }
+        }
+        if (failed) {
+            persist(region, fn);
+        }
+    }
+
+    /** AWS's stateReason for this was not seen, so it is the CreateWebFunctionRevision refusal for the same cause. */
+    private String lostCodeReason(WebFunction fn, WebFunctionRevision revision) {
+        WebFunctionRevision.BuildConfig build = revision.buildConfig;
+        try {
+            s3Service.headObject(build.bucket, build.key, revision.codeVersionId);
+        } catch (AwsException e) {
+            if (e.getHttpStatus() != 404) {
+                throw e;
+            }
+            return missingVersion(build, revision.codeVersionId);
+        }
+        return lambdaCanRead(fn, revision, revision.codeVersionId) ? null : lambdaCannotRead(build);
+    }
+
     private void requireLambdaCanRead(WebFunction fn, WebFunctionRevision revision, String versionId) {
+        if (!lambdaCanRead(fn, revision, versionId)) {
+            throw new AwsException("ValidationException", lambdaCannotRead(revision.buildConfig), 400);
+        }
+    }
+
+    /** AWS evaluates only s3:GetObjectVersion, although its message names both actions. */
+    private boolean lambdaCanRead(WebFunction fn, WebFunctionRevision revision, String versionId) {
         WebFunctionRevision.BuildConfig build = revision.buildConfig;
         AwsArnUtils.Arn function = AwsArnUtils.parse(fn.functionArn);
         String objectArn = AwsArnUtils.Arn.global(function.partition(), "s3", "", build.bucket + "/" + build.key)
                 .toString();
-        if (serviceCalls.authorize("lambda", "s3:GetObjectVersion", objectArn, revision.revisionArn,
+        return serviceCalls.authorize("lambda", "s3:GetObjectVersion", objectArn, revision.revisionArn,
                 function.accountId(), Map.of(IamConditionContextResolver.VERSION_ID, List.of(versionId)))
-                == Decision.DENY) {
-            throw new AwsException("ValidationException", "Lambda service principal " + ServicePrincipals.of("lambda")
-                    + " does not have s3:GetObject and s3:GetObjectVersion permission on s3://" + build.bucket + "/"
-                    + build.key + ". Update the bucket policy to grant the Lambda service principal access and retry.",
-                    400);
-        }
+                != Decision.DENY;
+    }
+
+    private static String lambdaCannotRead(WebFunctionRevision.BuildConfig build) {
+        return "Lambda service principal " + ServicePrincipals.of("lambda")
+                + " does not have s3:GetObject and s3:GetObjectVersion permission on s3://" + build.bucket + "/"
+                + build.key + ". Update the bucket policy to grant the Lambda service principal access and retry.";
+    }
+
+    private static String missingVersion(WebFunctionRevision.BuildConfig build, String versionId) {
+        return "The specified S3 object does not exist: s3://" + build.bucket + "/" + build.key
+                + " (versionId=" + versionId + "). Verify the object exists and the versionId is correct.";
     }
 
     private S3Service.ObjectRead openCode(WebFunctionRevision.BuildConfig build) {
@@ -796,9 +857,7 @@ public class LambdaWebService implements Resettable {
                         + ". Verify the object exists in the bucket.", 400);
             }
             if (e.getHttpStatus() == 404) {
-                throw new AwsException("ValidationException", "The specified S3 object does not exist: " + object
-                        + " (versionId=" + build.versionId + "). Verify the object exists and the versionId is correct.",
-                        400);
+                throw new AwsException("ValidationException", missingVersion(build, build.versionId), 400);
             }
             throw new AwsException("ValidationException", "The S3 object " + object + " (versionId=" + build.versionId
                     + ") is inaccessible. Verify the request parameters and permissions are correct.", 400);
@@ -934,6 +993,7 @@ public class LambdaWebService implements Resettable {
                 throw new AwsException("ConflictException", "The endpoint " + endpoint.endpointName
                         + " is in Failed state. The operation is allowed only when the endpoint is in Active state.", 409);
             }
+            failLostCode(region, fn, fn.revisions.values());
             WebFunctionEndpoint before = copy(endpoint, WebFunctionEndpoint.class);
 
             String effectiveMode = mode != null ? mode : endpoint.autoDeploymentMode;
@@ -1052,6 +1112,7 @@ public class LambdaWebService implements Resettable {
         if (fn.endpoints.containsKey(endpoint.endpointName)) {
             throw new AwsException("ConflictException", "The endpoint " + endpoint.endpointName + " already exists.", 409);
         }
+        failLostCode(region, fn, fn.revisions.values());
         if (initialRevision != null) {
             endpoint.revisionWeights = List.of(weight(initialRevision.revisionId, 100));
         } else if (!endpoint.revisionWeights.isEmpty()) {

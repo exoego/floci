@@ -221,6 +221,12 @@ public class LambdaWebDataPlane {
             page(request, LambdaWebErrorPages.ORIGIN_REQUEST_ERROR, requestId, false);
             return;
         }
+        if (revision.failureReason != null) {
+            request.resume();
+            metrics.answered(target, LambdaWebErrorPages.REVISION_NOT_ACTIVE.status());
+            page(request, LambdaWebErrorPages.REVISION_NOT_ACTIVE, requestId, false);
+            return;
+        }
         if ("100-continue".equalsIgnoreCase(request.getHeader("Expect"))) {
             request.response().writeContinue();
         }
